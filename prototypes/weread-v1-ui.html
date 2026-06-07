@@ -1,0 +1,776 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KOReader WeRead Plugin V1 Prototype</title>
+  <style>
+    :root {
+      --ink: #1b1b1b;
+      --muted: #626262;
+      --line: #cfcfcf;
+      --soft: #f2f2f2;
+      --paper: #fbfbf8;
+      --white: #ffffff;
+      --accent: #0b6f73;
+      --accent-soft: #e5f2f1;
+      --warn: #7b4d00;
+      --warn-soft: #f6ecd7;
+      --bad: #8b2f2f;
+      --bad-soft: #f4dfdf;
+      --shadow: 0 16px 45px rgba(0,0,0,.12);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #e8e8e4;
+      min-height: 100vh;
+    }
+
+    button, input {
+      font: inherit;
+    }
+
+    .page {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+    }
+
+    .rail {
+      background: #202020;
+      color: #f7f7f2;
+      padding: 24px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .brand {
+      padding: 4px 2px 14px;
+      border-bottom: 1px solid rgba(255,255,255,.18);
+    }
+
+    .brand h1 {
+      font-size: 22px;
+      line-height: 1.2;
+      margin: 0 0 8px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .brand p {
+      color: #c9c9c4;
+      margin: 0;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .nav {
+      display: grid;
+      gap: 6px;
+    }
+
+    .nav button {
+      border: 1px solid rgba(255,255,255,.12);
+      background: transparent;
+      color: #f7f7f2;
+      text-align: left;
+      padding: 11px 12px;
+      min-height: 42px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    .nav button:hover,
+    .nav button.active {
+      background: #f7f7f2;
+      color: #202020;
+      border-color: #f7f7f2;
+    }
+
+    .rail-footer {
+      margin-top: auto;
+      color: #c9c9c4;
+      font-size: 12px;
+      line-height: 1.5;
+      border-top: 1px solid rgba(255,255,255,.18);
+      padding-top: 14px;
+    }
+
+    main {
+      padding: 28px;
+      overflow: auto;
+    }
+
+    .device {
+      width: min(100%, 940px);
+      min-height: 720px;
+      margin: 0 auto;
+      background: var(--paper);
+      border: 1px solid #bdbdb8;
+      box-shadow: var(--shadow);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    .topbar {
+      min-height: 58px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 12px 18px;
+      background: var(--white);
+    }
+
+    .title-group {
+      min-width: 0;
+    }
+
+    .title-group h2 {
+      font-size: 22px;
+      line-height: 1.2;
+      margin: 0;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .title-group p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .status-pill {
+      border: 1px solid var(--line);
+      background: var(--soft);
+      border-radius: 999px;
+      padding: 7px 11px;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .content {
+      padding: 20px;
+    }
+
+    .screen {
+      display: none;
+    }
+
+    .screen.active {
+      display: block;
+    }
+
+    .grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .grid.two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      background: var(--white);
+      border-radius: 6px;
+      padding: 16px;
+    }
+
+    .panel h3 {
+      font-size: 17px;
+      line-height: 1.3;
+      margin: 0 0 10px;
+      letter-spacing: 0;
+    }
+
+    .panel p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+      margin: 0 0 12px;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .btn {
+      min-height: 38px;
+      border: 1px solid #222;
+      background: #222;
+      color: #fff;
+      border-radius: 5px;
+      padding: 8px 12px;
+      cursor: pointer;
+    }
+
+    .btn.secondary {
+      background: var(--white);
+      color: var(--ink);
+      border-color: var(--line);
+    }
+
+    .btn.ghost {
+      background: transparent;
+      color: var(--ink);
+      border-color: transparent;
+    }
+
+    .list {
+      border: 1px solid var(--line);
+      background: var(--white);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      align-items: center;
+      cursor: pointer;
+    }
+
+    .row:last-child {
+      border-bottom: 0;
+    }
+
+    .row:hover {
+      background: var(--soft);
+    }
+
+    .row strong {
+      display: block;
+      font-size: 16px;
+      line-height: 1.35;
+      margin-bottom: 4px;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .tag {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 12px;
+      color: var(--muted);
+      background: var(--soft);
+      white-space: nowrap;
+    }
+
+    .tag.good {
+      color: var(--accent);
+      background: var(--accent-soft);
+      border-color: #b7d8d5;
+    }
+
+    .tag.warn {
+      color: var(--warn);
+      background: var(--warn-soft);
+      border-color: #dbc696;
+    }
+
+    .tag.bad {
+      color: var(--bad);
+      background: var(--bad-soft);
+      border-color: #d8b1b1;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 12px;
+    }
+
+    .field label {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .field input {
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 5px;
+      min-height: 38px;
+      padding: 8px 10px;
+      width: 100%;
+    }
+
+    .progress {
+      height: 10px;
+      background: #deded8;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+
+    .progress > span {
+      display: block;
+      height: 100%;
+      width: var(--value);
+      background: #222;
+    }
+
+    .split-progress {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin: 14px 0;
+    }
+
+    .note-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .note {
+      border-left: 3px solid #222;
+      background: var(--white);
+      padding: 12px;
+      border-radius: 0 5px 5px 0;
+    }
+
+    .footer {
+      min-height: 42px;
+      border-top: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 18px;
+      color: var(--muted);
+      font-size: 12px;
+      background: var(--white);
+    }
+
+    .reader-preview {
+      display: grid;
+      grid-template-columns: 1fr 300px;
+      gap: 16px;
+    }
+
+    .book-page {
+      border: 1px solid var(--line);
+      background: #fff;
+      padding: 26px 34px;
+      min-height: 500px;
+      font-family: Georgia, "Times New Roman", "Songti SC", serif;
+      line-height: 1.85;
+      font-size: 18px;
+    }
+
+    .book-page h3 {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 24px;
+      margin: 0 0 20px;
+    }
+
+    .mini-menu {
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .mini-menu button {
+      width: 100%;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+      text-align: left;
+      padding: 13px 14px;
+      min-height: 44px;
+      cursor: pointer;
+    }
+
+    .mini-menu button:last-child {
+      border-bottom: 0;
+    }
+
+    .mini-menu button:hover {
+      background: var(--soft);
+    }
+
+    @media (max-width: 860px) {
+      .page {
+        grid-template-columns: 1fr;
+      }
+
+      .rail {
+        position: static;
+      }
+
+      .nav {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      main {
+        padding: 14px;
+      }
+
+      .device {
+        min-height: 640px;
+      }
+
+      .grid.two,
+      .reader-preview,
+      .split-progress {
+        grid-template-columns: 1fr;
+      }
+
+      .row {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <aside class="rail">
+      <div class="brand">
+        <h1>KOReader WeRead</h1>
+        <p>V1 页面体感原型。模拟插件在 KOReader 里的菜单、列表和对话框。</p>
+      </div>
+      <nav class="nav" aria-label="Prototype screens">
+        <button class="active" data-screen="home">主菜单</button>
+        <button data-screen="setup">首次配置</button>
+        <button data-screen="shelf">书架</button>
+        <button data-screen="details">书籍详情</button>
+        <button data-screen="downloads">下载队列</button>
+        <button data-screen="sync">进度同步</button>
+        <button data-screen="reader">阅读中菜单</button>
+        <button data-screen="notes">标注</button>
+        <button data-screen="settings">设置</button>
+      </nav>
+      <div class="rail-footer">
+        设计原则：少层级、强状态、慢操作显式确认。v1 先把读书和进度同步做稳。
+      </div>
+    </aside>
+
+    <main>
+      <section class="device" aria-live="polite">
+        <header class="topbar">
+          <div class="title-group">
+            <h2 id="screen-title">Tools -> WeRead</h2>
+            <p id="screen-subtitle">插件主菜单，文件管理器和阅读器里都能进入。</p>
+          </div>
+          <span class="status-pill" id="status-pill">Cookie 有效 · API 已配置</span>
+        </header>
+
+        <div class="content">
+          <section class="screen active" id="home">
+            <div class="grid two">
+              <article class="panel">
+                <h3>书架</h3>
+                <p>从官方 skill 读取书架、进度和最近阅读时间。没有 API key 时可以走 reader URL fallback。</p>
+                <div class="actions">
+                  <button class="btn" data-screen="shelf">打开书架</button>
+                  <button class="btn secondary" data-screen="setup">配置账号</button>
+                </div>
+              </article>
+              <article class="panel">
+                <h3>搜索</h3>
+                <p>搜索微信读书里的书。v1 只负责打开和下载，不做未验证的加入书架写操作。</p>
+                <div class="field">
+                  <label>关键词</label>
+                  <input value="持续交付" aria-label="search keyword">
+                </div>
+                <button class="btn">搜索</button>
+              </article>
+              <article class="panel">
+                <h3>粘贴 reader URL</h3>
+                <p>开发者和无 API key 兜底路径。通过 reader HTML 解析 bookId、token、psvts、pclts。</p>
+                <div class="actions">
+                  <button class="btn secondary" data-screen="details">解析示例链接</button>
+                </div>
+              </article>
+              <article class="panel">
+                <h3>同步与下载</h3>
+                <p>进度上报走 /web/book/read，下载缓存走章节 shard 和 tar 图片包。</p>
+                <div class="actions">
+                  <button class="btn secondary" data-screen="sync">同步状态</button>
+                  <button class="btn secondary" data-screen="downloads">下载队列</button>
+                </div>
+              </article>
+            </div>
+          </section>
+
+          <section class="screen" id="setup">
+            <div class="grid two">
+              <article class="panel">
+                <h3>导入 Cookie / cURL</h3>
+                <p>内容抓取必须依赖微信读书 Web cookie。建议直接粘贴浏览器复制的 cURL。</p>
+                <div class="field">
+                  <label>Cookie 或完整 cURL</label>
+                  <input value="curl 'https://weread.qq.com/web/book/read' ...">
+                </div>
+                <div class="actions">
+                  <button class="btn">测试登录</button>
+                  <button class="btn secondary">保存</button>
+                </div>
+              </article>
+              <article class="panel">
+                <h3>官方 API Key</h3>
+                <p>用于书架、搜索、进度读取和笔记读取。没有也可以先用粘贴 reader URL 跑通阅读。</p>
+                <div class="field">
+                  <label>WEREAD_API_KEY</label>
+                  <input value="wr_api_••••••••••••">
+                </div>
+                <div class="actions">
+                  <button class="btn">测试 API</button>
+                  <button class="btn secondary">跳过</button>
+                </div>
+              </article>
+              <article class="panel">
+                <h3>检查结果</h3>
+                <p><span class="tag good">wr_skey 有效</span> <span class="tag good">续期成功</span> <span class="tag good">API 可用</span></p>
+                <p>首次配置完成后进入书架；如果 API 不可用，则显示 reader URL 入口。</p>
+              </article>
+            </div>
+          </section>
+
+          <section class="screen" id="shelf">
+            <div class="actions" style="margin-bottom: 12px;">
+              <button class="btn">刷新</button>
+              <button class="btn secondary">搜索</button>
+              <button class="btn secondary">筛选</button>
+            </div>
+            <div class="list">
+              <div class="row" data-screen="details">
+                <div>
+                  <strong>持续交付 2.0：业务引领的 DevOps 精要</strong>
+                  <div class="meta">乔梁 · 65% · 最近阅读 2026-06-06 · Cache: partial</div>
+                </div>
+                <span class="tag warn">42 / 134</span>
+              </div>
+              <div class="row">
+                <div>
+                  <strong>凤凰架构</strong>
+                  <div class="meta">周志明 · 28% · 最近阅读 2026-06-01 · Cache: ready</div>
+                </div>
+                <span class="tag good">Ready</span>
+              </div>
+              <div class="row">
+                <div>
+                  <strong>代码整洁之道</strong>
+                  <div class="meta">Robert C. Martin · 4% · 最近阅读 2026-05-28 · Cache: none</div>
+                </div>
+                <span class="tag">None</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" id="details">
+            <div class="grid two">
+              <article class="panel">
+                <h3>持续交付 2.0</h3>
+                <p>乔梁 · 技术管理 · 已解析 bookId、catalog、reader token。</p>
+                <div class="actions">
+                  <button class="btn" data-screen="reader">打开阅读</button>
+                  <button class="btn secondary" data-screen="downloads">下载全书</button>
+                  <button class="btn secondary" data-screen="sync">同步进度</button>
+                </div>
+              </article>
+              <article class="panel">
+                <h3>缓存状态</h3>
+                <p>章节 42 / 134，图片 96 / 282，失败 0。</p>
+                <div class="progress" style="--value:31%;"><span></span></div>
+              </article>
+              <article class="panel">
+                <h3>远端进度</h3>
+                <p>章节 4.1 · 58% · 累计阅读 6 小时 12 分钟。</p>
+                <span class="tag">来自 /book/getprogress</span>
+              </article>
+              <article class="panel">
+                <h3>本地进度</h3>
+                <p>章节 4.3 · 65% · 当前 KOReader 位置更靠后。</p>
+                <span class="tag good">建议上传本地</span>
+              </article>
+            </div>
+          </section>
+
+          <section class="screen" id="downloads">
+            <div class="list">
+              <div class="row">
+                <div>
+                  <strong>持续交付 2.0</strong>
+                  <div class="meta">42 / 134 chapters · 96 / 282 images · 正在等待继续</div>
+                  <div class="progress" style="--value:31%; margin-top:10px;"><span></span></div>
+                </div>
+                <span class="tag warn">Paused</span>
+              </div>
+              <div class="row">
+                <div>
+                  <strong>凤凰架构</strong>
+                  <div class="meta">91 / 91 chapters · 144 images · 可离线阅读</div>
+                </div>
+                <span class="tag good">Ready</span>
+              </div>
+            </div>
+            <div class="actions" style="margin-top: 14px;">
+              <button class="btn">继续</button>
+              <button class="btn secondary">暂停</button>
+              <button class="btn secondary">重试失败</button>
+              <button class="btn secondary">打开可用章节</button>
+            </div>
+          </section>
+
+          <section class="screen" id="sync">
+            <article class="panel">
+              <h3>同步进度确认</h3>
+              <p>本地位置比远端更新。上传后会调用 /web/book/read，更新章节、偏移、进度和阅读时长。</p>
+              <div class="split-progress">
+                <div class="panel">
+                  <h3>本地位置</h3>
+                  <p>4.3 行动原则<br>65% · offset 1840</p>
+                  <div class="progress" style="--value:65%;"><span></span></div>
+                </div>
+                <div class="panel">
+                  <h3>远端位置</h3>
+                  <p>4.1 文化建设<br>58% · offset 920</p>
+                  <div class="progress" style="--value:58%;"><span></span></div>
+                </div>
+              </div>
+              <div class="actions">
+                <button class="btn">上传本地</button>
+                <button class="btn secondary">使用远端</button>
+                <button class="btn secondary">取消</button>
+              </div>
+            </article>
+          </section>
+
+          <section class="screen" id="reader">
+            <div class="reader-preview">
+              <article class="book-page">
+                <h3>4.3 行动原则</h3>
+                <p>虽然，我们总结了塑造企业文化的四步法，但在实际执行过程中，仍旧会遇到各种各样的挑战。</p>
+                <p>复杂系统较难定义，且它存在于世界各个角落。它既不是简单系统，也不是随机系统，而是一个非线性的复合系统。</p>
+              </article>
+              <aside class="mini-menu">
+                <button data-screen="sync">Sync progress now</button>
+                <button data-screen="sync">Show remote progress</button>
+                <button data-screen="details">Book details</button>
+                <button data-screen="notes">Notes</button>
+                <button data-screen="downloads">Download remaining chapters</button>
+                <button data-screen="settings">Cache settings</button>
+              </aside>
+            </div>
+          </section>
+
+          <section class="screen" id="notes">
+            <div class="actions" style="margin-bottom: 12px;">
+              <button class="btn">划线</button>
+              <button class="btn secondary">我的想法</button>
+              <button class="btn secondary">热门划线</button>
+            </div>
+            <div class="note-list">
+              <div class="note">
+                <strong>第 4 章 · range 393-401</strong>
+                <p>复杂系统较难定义，且它存在于世界各个角落。</p>
+                <button class="btn secondary">跳到章节</button>
+              </div>
+              <div class="note">
+                <strong>第 1 章 · range 120-166</strong>
+                <p>持续交付关注从提交代码到产品发布的完整过程。</p>
+                <button class="btn secondary">跳到章节</button>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" id="settings">
+            <div class="grid two">
+              <article class="panel">
+                <h3>账号</h3>
+                <p><span class="tag good">Cookie 有效</span> <span class="tag">上次续期 17:32</span></p>
+                <div class="actions">
+                  <button class="btn secondary">重新导入 cURL</button>
+                  <button class="btn secondary">立即续期</button>
+                </div>
+              </article>
+              <article class="panel">
+                <h3>同步</h3>
+                <p>打开书籍时拉取远端进度：开<br>关闭书籍时上传本地进度：开<br>定时上传：关</p>
+                <button class="btn secondary">修改</button>
+              </article>
+              <article class="panel">
+                <h3>缓存</h3>
+                <p>图片下载：开<br>最大缓存：1 GB<br>失败章节：0</p>
+                <div class="actions">
+                  <button class="btn secondary">清理失败</button>
+                  <button class="btn secondary">清空缓存</button>
+                </div>
+              </article>
+              <article class="panel">
+                <h3>高级</h3>
+                <p>开发日志默认关闭。调试时可以 dump /web/book/read payload，不输出正文。</p>
+                <button class="btn secondary">Dump payload</button>
+              </article>
+            </div>
+          </section>
+        </div>
+
+        <footer class="footer">
+          <span id="footer-left">V1 Prototype · e-ink friendly</span>
+          <span>Page <span id="page-num">1</span> / 9</span>
+        </footer>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const labels = {
+      home: ["Tools -> WeRead", "插件主菜单，文件管理器和阅读器里都能进入。", "Cookie 有效 · API 已配置"],
+      setup: ["首次配置", "导入 Cookie/cURL，设置官方 API key。", "需要一次性配置"],
+      shelf: ["书架", "从官方 skill 读取；缺 API key 时走 reader URL。", "最近同步 17:36"],
+      details: ["书籍详情", "元数据、缓存、远端进度、本地进度放在同一页。", "Cache partial"],
+      downloads: ["下载队列", "全书缓存显式触发，可暂停、恢复、重试。", "1 个任务暂停"],
+      sync: ["进度同步", "本地和远端有差异时，让用户确认方向。", "等待确认"],
+      reader: ["阅读中 WeRead 菜单", "阅读页里只放当前书相关动作。", "Local 65%"],
+      notes: ["标注", "v1 先做只读查看和跳章节，不写回 WeRead。", "Read-only"],
+      settings: ["设置", "账号、API、同步、缓存和高级调试。", "配置完整"]
+    };
+
+    const order = Object.keys(labels);
+    const buttons = document.querySelectorAll("[data-screen]");
+    const navButtons = document.querySelectorAll(".nav button");
+    const screens = document.querySelectorAll(".screen");
+    const title = document.getElementById("screen-title");
+    const subtitle = document.getElementById("screen-subtitle");
+    const pill = document.getElementById("status-pill");
+    const pageNum = document.getElementById("page-num");
+
+    function showScreen(id) {
+      screens.forEach(screen => screen.classList.toggle("active", screen.id === id));
+      navButtons.forEach(button => button.classList.toggle("active", button.dataset.screen === id));
+      title.textContent = labels[id][0];
+      subtitle.textContent = labels[id][1];
+      pill.textContent = labels[id][2];
+      pageNum.textContent = String(order.indexOf(id) + 1);
+    }
+
+    buttons.forEach(button => {
+      button.addEventListener("click", () => {
+        const id = button.dataset.screen;
+        if (id) showScreen(id);
+      });
+    });
+  </script>
+</body>
+</html>

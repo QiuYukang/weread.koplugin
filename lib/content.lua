@@ -1,0 +1,836 @@
+local Crypto = require("lib.crypto")
+local WeRead = require("lib.weread")
+local bit = require("bit")
+
+local Content = {}
+
+local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function basename_safe(value)
+    value = tostring(value or ""):gsub("[^%w%._-]", "_")
+    if value == "" then
+        value = "weread"
+    end
+    return value
+end
+
+local function filename_safe(value)
+    value = tostring(value or ""):gsub("[%z%c/\\:%*%?\"<>|]", "_")
+    value = value:gsub("^%s+", ""):gsub("%s+$", "")
+    value = value:gsub("%s+", " ")
+    if value == "" then
+        value = "weread"
+    end
+    return value
+end
+
+local function item_id(prefix, value)
+    return prefix .. basename_safe(value):gsub("%.", "_")
+end
+
+local function utc_modified()
+    return os.date("!%Y-%m-%dT%H:%M:%SZ")
+end
+
+local function media_type_for(data)
+    if data:sub(1, 8) == "\137PNG\r\n\026\n" then
+        return ".png", "image/png"
+    elseif data:sub(1, 3) == "\255\216\255" then
+        return ".jpg", "image/jpeg"
+    elseif data:sub(1, 6) == "GIF87a" or data:sub(1, 6) == "GIF89a" then
+        return ".gif", "image/gif"
+    elseif data:sub(1, 4) == "RIFF" and data:sub(9, 12) == "WEBP" then
+        return ".webp", "image/webp"
+    end
+    return ".bin", "application/octet-stream"
+end
+
+local function trim_nulls(value)
+    return tostring(value or ""):gsub("%z.*$", ""):gsub("%s+$", "")
+end
+
+local function tar_entries(data)
+    local entries = {}
+    local offset = 1
+    while offset + 511 <= #data do
+        local header = data:sub(offset, offset + 511)
+        if header:match("^%z+$") then
+            break
+        end
+        local name = trim_nulls(header:sub(1, 100))
+        local size_text = trim_nulls(header:sub(125, 136)):gsub("%s", "")
+        local size = tonumber(size_text, 8) or 0
+        local typeflag = header:sub(157, 157)
+        local body_start = offset + 512
+        local body_end = body_start + size - 1
+        if name ~= "" and (typeflag == "0" or typeflag == "" or typeflag == "\0") and size > 0 then
+            table.insert(entries, {
+                name = name,
+                data = data:sub(body_start, body_end),
+            })
+        end
+        offset = body_start + math.ceil(size / 512) * 512
+    end
+    return entries
+end
+
+local function basename(path)
+    return tostring(path or ""):match("([^/]+)$") or tostring(path or "")
+end
+
+local function unique_asset_name(used, name, ext)
+    local base = filename_safe(name)
+    if not base:lower():match(ext:gsub("%.", "%%.") .. "$") then
+        base = base .. ext
+    end
+    local candidate = base
+    local index = 2
+    while used[candidate] do
+        local stem = base:gsub("%.[^%.]+$", "")
+        candidate = stem .. "-" .. tostring(index) .. ext
+        index = index + 1
+    end
+    used[candidate] = true
+    return candidate
+end
+
+local function write_file(path, data)
+    local file, err = io.open(path, "wb")
+    if not file then
+        error(err)
+    end
+    file:write(data)
+    file:close()
+end
+
+local crc32_table
+local function crc32(data)
+    if not crc32_table then
+        crc32_table = {}
+        for i = 0, 255 do
+            local crc = i
+            for bit_index = 1, 8 do
+                if bit.band(crc, 1) ~= 0 then
+                    crc = bit.bxor(bit.rshift(crc, 1), 0xedb88320)
+                else
+                    crc = bit.rshift(crc, 1)
+                end
+            end
+            crc32_table[i] = crc
+        end
+    end
+    local crc = 0xffffffff
+    for i = 1, #data do
+        local index = bit.band(bit.bxor(crc, data:byte(i)), 0xff)
+        crc = bit.bxor(bit.rshift(crc, 8), crc32_table[index])
+    end
+    return bit.bxor(crc, 0xffffffff)
+end
+
+local function le16(n)
+    return string.char(bit.band(n, 0xff), bit.band(bit.rshift(n, 8), 0xff))
+end
+
+local function le32(n)
+    return string.char(
+        bit.band(n, 0xff),
+        bit.band(bit.rshift(n, 8), 0xff),
+        bit.band(bit.rshift(n, 16), 0xff),
+        bit.band(bit.rshift(n, 24), 0xff)
+    )
+end
+
+local function make_zip(entries)
+    local out = {}
+    local central = {}
+    local offset = 0
+
+    for entry_index, entry in ipairs(entries) do
+        local name = entry.name
+        local data = entry.data or ""
+        local crc = crc32(data)
+        local local_header = table.concat({
+            le32(0x04034b50),
+            le16(20),
+            le16(0),
+            le16(0),
+            le16(0),
+            le16(0),
+            le32(crc),
+            le32(#data),
+            le32(#data),
+            le16(#name),
+            le16(0),
+            name,
+        })
+        table.insert(out, local_header)
+        table.insert(out, data)
+
+        table.insert(central, table.concat({
+            le32(0x02014b50),
+            le16(20),
+            le16(20),
+            le16(0),
+            le16(0),
+            le16(0),
+            le16(0),
+            le32(crc),
+            le32(#data),
+            le32(#data),
+            le16(#name),
+            le16(0),
+            le16(0),
+            le16(0),
+            le16(0),
+            le32(0),
+            le32(offset),
+            name,
+        }))
+
+        offset = offset + #local_header + #data
+    end
+
+    local central_data = table.concat(central)
+    table.insert(out, central_data)
+    table.insert(out, table.concat({
+        le32(0x06054b50),
+        le16(0),
+        le16(0),
+        le16(#entries),
+        le16(#entries),
+        le32(#central_data),
+        le32(offset),
+        le16(0),
+    }))
+    return table.concat(out)
+end
+
+local function xml_escape(value)
+    value = tostring(value or "")
+    value = value:gsub("&", "&amp;")
+    value = value:gsub("<", "&lt;")
+    value = value:gsub(">", "&gt;")
+    value = value:gsub("\"", "&quot;")
+    return value
+end
+
+local function body_fragment(xhtml)
+    xhtml = tostring(xhtml or "")
+    local body = xhtml:match("<body[^>]*>(.-)</body>")
+        or xhtml:match("<body[^>]*>(.*)")
+    if body then
+        return body
+    end
+    xhtml = xhtml:gsub("<%?xml.-%?>", "")
+    xhtml = xhtml:gsub("<!DOCTYPE.-%>", "")
+    return xhtml
+end
+
+local function checked_body(response_text)
+    if not response_text or #response_text <= 32 then
+        return ""
+    end
+    local expected = response_text:sub(1, 32)
+    local body = response_text:sub(33)
+    local actual = Crypto.md5_hex(body):upper()
+    if actual ~= expected then
+        error("Shard MD5 mismatch")
+    end
+    return body
+end
+
+local function base64_decode(data)
+    data = data:gsub("-", "+"):gsub("_", "/")
+    local pad = #data % 4
+    if pad > 0 then
+        data = data .. string.rep("=", 4 - pad)
+    end
+    data = data:gsub("[^" .. b64chars .. "=]", "")
+    return (data:gsub(".", function(char)
+        if char == "=" then
+            return ""
+        end
+        local bits = ""
+        local index = b64chars:find(char, 1, true) - 1
+        for bit = 6, 1, -1 do
+            bits = bits .. (index % 2 ^ bit - index % 2 ^ (bit - 1) > 0 and "1" or "0")
+        end
+        return bits
+    end):gsub("%d%d%d?%d?%d?%d?%d?%d?", function(bits)
+        if #bits ~= 8 then
+            return ""
+        end
+        local byte = 0
+        for i = 1, 8 do
+            if bits:sub(i, i) == "1" then
+                byte = byte + 2 ^ (8 - i)
+            end
+        end
+        return string.char(byte)
+    end))
+end
+
+local function swap_positions(encoded)
+    local length = #encoded
+    if length < 4 then
+        return {}
+    end
+    if length < 11 then
+        return {0, 2}
+    end
+
+    local n = math.min(4, math.floor((length + 9) / 10))
+    local tmp = {}
+    for i = length, length - n + 1, -1 do
+        local byte = encoded:byte(i)
+        local bin = {}
+        repeat
+            table.insert(bin, 1, tostring(byte % 2))
+            byte = math.floor(byte / 2)
+        until byte == 0
+        local value = tonumber(table.concat(bin), 4) or 0
+        table.insert(tmp, tostring(value))
+    end
+    tmp = table.concat(tmp)
+
+    local result = {}
+    local m = length - n - 2
+    local step = #tostring(m)
+    local i = 1
+    while #result < 10 and i + step < #tmp do
+        table.insert(result, (tonumber(tmp:sub(i, i + step - 1)) or 0) % m)
+        table.insert(result, (tonumber(tmp:sub(i + 1, i + step)) or 0) % m)
+        i = i + step
+    end
+    return result
+end
+
+local function reverse_swaps(encoded, positions)
+    local chars = {}
+    for i = 1, #encoded do
+        chars[i] = encoded:sub(i, i)
+    end
+    for i = #positions, 1, -2 do
+        for k = 1, 0, -1 do
+            local left = positions[i] + k + 1
+            local right = positions[i - 1] + k + 1
+            chars[left], chars[right] = chars[right], chars[left]
+        end
+    end
+    return table.concat(chars)
+end
+
+local function decode_encoded_body(body)
+    if #body == 0 then
+        return ""
+    end
+    local encoded = body:sub(2)
+    local restored = reverse_swaps(encoded, swap_positions(encoded))
+    return base64_decode(restored)
+end
+
+function Content.decode_content_shards(e0, e1, e3)
+    local body = checked_body(e0) .. checked_body(e1) .. checked_body(e3)
+    return decode_encoded_body(body)
+end
+
+function Content.decode_content_shard(e0)
+    return decode_encoded_body(checked_body(e0))
+end
+
+function Content.extract_reader_state(html)
+    return {
+        book_id = html:match([["bookId"%s*:%s*"([^"]+)"]]) or html:match([["bookId"%s*:%s*(%d+)]]),
+        title = html:match([["title"%s*:%s*"([^"]+)"]]),
+        author = html:match([["author"%s*:%s*"([^"]+)"]]),
+        psvts = html:match([["psvts"%s*:%s*"([^"]+)"]]),
+        pclts = html:match([["pclts"%s*:%s*"([^"]+)"]]),
+        token = html:match([["token"%s*:%s*"([^"]+)"]]),
+    }
+end
+
+function Content.normalize_chapters(payload, book_id)
+    local records = payload
+    if type(payload) == "table" and payload.data then
+        records = payload.data
+    end
+    if type(records) ~= "table" then
+        return {}
+    end
+    if records.bookId or records.updated then
+        records = { records }
+    end
+    for record_index, record in ipairs(records) do
+        if tostring(record.bookId or "") == tostring(book_id) then
+            return record.updated or record.chapterInfos or record.chapters or {}
+        end
+    end
+    return {}
+end
+
+function Content.first_readable_chapter(chapters)
+    for chapter_index, chapter in ipairs(chapters or {}) do
+        if tonumber(chapter.wordCount or 0) > 0 and tostring(chapter.title or "") ~= "封面" then
+            return chapter
+        end
+    end
+end
+
+function Content.readable_chapters(chapters)
+    local out = {}
+    for chapter_index, chapter in ipairs(chapters or {}) do
+        if tonumber(chapter.wordCount or 0) > 0 and tostring(chapter.title or "") ~= "封面" then
+            table.insert(out, chapter)
+        end
+    end
+    return out
+end
+
+local function chapter_level(chapter)
+    local level = tonumber(chapter and chapter.level or 1) or 1
+    if level < 1 then
+        level = 1
+    elseif level > 6 then
+        level = 6
+    end
+    return level
+end
+
+local function build_chapter_tree(chapters, filename_for)
+    local root = { children = {} }
+    local stack = { root }
+    for chapter_index, chapter in ipairs(chapters or {}) do
+        local level = chapter_level(chapter)
+        if level > #stack then
+            level = #stack
+        end
+        while #stack > level do
+            table.remove(stack)
+        end
+        local parent = stack[#stack] or root
+        local node = {
+            title = chapter.title or ("Chapter " .. tostring(chapter.chapterUid or chapter_index)),
+            href = filename_for(chapter_index, chapter),
+            children = {},
+        }
+        table.insert(parent.children, node)
+        stack[level + 1] = node
+    end
+    return root.children
+end
+
+local function build_nav_items(chapters, filename_for)
+    local tree = build_chapter_tree(chapters, filename_for)
+    local function render(nodes)
+        local out = {}
+        for node_index, node in ipairs(nodes or {}) do
+            table.insert(out, [[<li><a href="]] .. xml_escape(node.href) .. [[">]] .. xml_escape(node.title) .. [[</a>]])
+            if node.children and #node.children > 0 then
+                table.insert(out, "<ol>")
+                table.insert(out, render(node.children))
+                table.insert(out, "</ol>")
+            end
+            table.insert(out, "</li>")
+        end
+        return table.concat(out, "\n")
+    end
+
+    return render(tree)
+end
+
+local function build_ncx_points(chapters, filename_for)
+    local tree = build_chapter_tree(chapters, filename_for)
+    local play_order = 0
+    local function render(nodes)
+        local out = {}
+        for node_index, node in ipairs(nodes or {}) do
+            play_order = play_order + 1
+            local current_order = play_order
+            table.insert(out, [[<navPoint id="navPoint-]] .. tostring(current_order) .. [[" playOrder="]] .. tostring(current_order) .. [[">]])
+            table.insert(out, [[<navLabel><text>]] .. xml_escape(node.title) .. [[</text></navLabel>]])
+            table.insert(out, [[<content src="]] .. xml_escape(node.href) .. [["/>]])
+            if node.children and #node.children > 0 then
+                table.insert(out, render(node.children))
+            end
+            table.insert(out, "</navPoint>")
+        end
+        return table.concat(out, "\n")
+    end
+    return render(tree), play_order
+end
+
+function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
+    local book_id = book.book_id or book.bookId
+    local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
+    os.execute("mkdir -p " .. string.format("%q", dir))
+    local book_title = book.title or "WeRead"
+    local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
+    local title = chapter.title or book.title or "WeRead"
+    local author = book.author or "WeRead"
+    local manifest_assets = {}
+    local asset_entries = {}
+    for asset_index, asset in ipairs(assets or {}) do
+        table.insert(manifest_assets, [[<item id="asset_]] .. tostring(asset_index) .. [[" href="]] .. xml_escape(asset.href) .. [[" media-type="]] .. xml_escape(asset.media_type) .. [["/>]])
+        table.insert(asset_entries, { name = "OEBPS/" .. asset.href, data = asset.data })
+    end
+    local chapter_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN">
+<head>
+<title>]] .. xml_escape(title) .. [[</title>
+<link rel="stylesheet" type="text/css" href="../style.css"/>
+</head>
+<body>
+]] .. body_fragment(xhtml) .. [[
+</body>
+</html>]]
+    local opf = [[<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="3.0" prefix="dcterms: http://purl.org/dc/terms/">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="bookid">weread-]] .. xml_escape(book_id) .. [[-]] .. xml_escape(chapter.chapterUid or "chapter") .. [[</dc:identifier>
+<dc:title>]] .. xml_escape(book_title) .. [[</dc:title>
+<dc:creator>]] .. xml_escape(author) .. [[</dc:creator>
+<dc:publisher>WeRead</dc:publisher>
+<dc:source>]] .. xml_escape(WeRead.reader_url(book_id, chapter.chapterUid)) .. [[</dc:source>
+<dc:language>zh-CN</dc:language>
+<meta property="dcterms:modified">]] .. utc_modified() .. [[</meta>
+</metadata>
+<manifest>
+<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+<item id="style" href="style.css" media-type="text/css"/>
+<item id="chapter" href="text/chapter.xhtml" media-type="application/xhtml+xml"/>
+]] .. table.concat(manifest_assets, "\n") .. [[
+</manifest>
+<spine>
+<itemref idref="chapter"/>
+</spine>
+</package>]]
+    local nav = [[<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Navigation</title></head>
+<body>
+<nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops">
+<ol><li><a href="text/chapter.xhtml">]] .. xml_escape(title) .. [[</a></li></ol>
+</nav>
+</body>
+</html>]]
+    css = css or [[body { line-height: 1.7; margin: 5%; } img { max-width: 100%; }]]
+    local entries = {
+        { name = "mimetype", data = "application/epub+zip" },
+        { name = "META-INF/container.xml", data = [[<?xml version="1.0" encoding="utf-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>]] },
+        { name = "OEBPS/content.opf", data = opf },
+        { name = "OEBPS/nav.xhtml", data = nav },
+        { name = "OEBPS/style.css", data = css },
+        { name = "OEBPS/text/chapter.xhtml", data = chapter_xhtml },
+    }
+    for asset_index, asset in ipairs(asset_entries) do
+        table.insert(entries, asset)
+    end
+    write_file(path, make_zip(entries))
+    return path
+end
+
+function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css)
+    local book_id = book.book_id or book.bookId
+    local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
+    os.execute("mkdir -p " .. string.format("%q", dir))
+    local book_title = book.title or "WeRead"
+    local path = dir .. "/" .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub"
+    local author = book.author or "WeRead"
+    local manifest_items = {
+        [[<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>]],
+        [[<item id="toc" href="toc.ncx" media-type="application/x-dtbncx+xml"/>]],
+        [[<item id="style" href="style.css" media-type="text/css"/>]],
+    }
+    local spine_items = {}
+    local entries = {
+        { name = "mimetype", data = "application/epub+zip" },
+        { name = "META-INF/container.xml", data = [[<?xml version="1.0" encoding="utf-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>]] },
+    }
+    for asset_index, asset in ipairs(assets or {}) do
+        table.insert(manifest_items, [[<item id="asset_]] .. tostring(asset_index) .. [[" href="]] .. xml_escape(asset.href) .. [[" media-type="]] .. xml_escape(asset.media_type) .. [["/>]])
+        table.insert(entries, { name = "OEBPS/" .. asset.href, data = asset.data })
+    end
+
+    for chapter_index, chapter in ipairs(chapters or {}) do
+        local uid = tostring(chapter.chapterUid or chapter_index)
+        local filename = string.format("text/chapter-%03d.xhtml", chapter_index)
+        local id = item_id("chapter_", uid)
+        local title = chapter.title or ("Chapter " .. uid)
+        local chapter_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN">
+<head>
+<title>]] .. xml_escape(title) .. [[</title>
+<link rel="stylesheet" type="text/css" href="../style.css"/>
+</head>
+<body>
+]] .. body_fragment(chapter_bodies[uid] or "") .. [[
+</body>
+</html>]]
+        table.insert(entries, { name = "OEBPS/" .. filename, data = chapter_xhtml })
+        table.insert(manifest_items, [[<item id="]] .. id .. [[" href="]] .. filename .. [[" media-type="application/xhtml+xml"/>]])
+        table.insert(spine_items, [[<itemref idref="]] .. id .. [["/>]])
+    end
+
+    local opf = [[<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="3.0" prefix="dcterms: http://purl.org/dc/terms/">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="bookid">weread-]] .. xml_escape(book_id) .. [[-]] .. xml_escape(suffix or "book") .. [[</dc:identifier>
+<dc:title>]] .. xml_escape(book_title) .. [[</dc:title>
+<dc:creator>]] .. xml_escape(author) .. [[</dc:creator>
+<dc:publisher>WeRead</dc:publisher>
+<dc:source>]] .. xml_escape(WeRead.reader_url(book_id)) .. [[</dc:source>
+<dc:language>zh-CN</dc:language>
+<meta property="dcterms:modified">]] .. utc_modified() .. [[</meta>
+</metadata>
+<manifest>
+]] .. table.concat(manifest_items, "\n") .. [[
+</manifest>
+<spine toc="toc">
+]] .. table.concat(spine_items, "\n") .. [[
+</spine>
+</package>]]
+    local ncx_points = build_ncx_points(chapters, function(chapter_index)
+        return string.format("text/chapter-%03d.xhtml", chapter_index)
+    end)
+    local ncx = [[<?xml version="1.0" encoding="utf-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<head>
+<meta name="dtb:uid" content="weread-]] .. xml_escape(book_id) .. [[-]] .. xml_escape(suffix or "book") .. [["/>
+<meta name="dtb:depth" content="6"/>
+<meta name="dtb:totalPageCount" content="0"/>
+<meta name="dtb:maxPageNumber" content="0"/>
+</head>
+<docTitle><text>]] .. xml_escape(book_title) .. [[</text></docTitle>
+<navMap>
+]] .. ncx_points .. [[
+</navMap>
+</ncx>]]
+    local nav = [[<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Navigation</title></head>
+<body>
+<nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops">
+<ol>
+]] .. build_nav_items(chapters, function(chapter_index)
+        return string.format("text/chapter-%03d.xhtml", chapter_index)
+    end) .. [[
+</ol>
+</nav>
+</body>
+</html>]]
+    css = css or [[body { line-height: 1.7; margin: 5%; } img { max-width: 100%; }]]
+    table.insert(entries, { name = "OEBPS/content.opf", data = opf })
+    table.insert(entries, { name = "OEBPS/nav.xhtml", data = nav })
+    table.insert(entries, { name = "OEBPS/toc.ncx", data = ncx })
+    table.insert(entries, { name = "OEBPS/style.css", data = css })
+    write_file(path, make_zip(entries))
+    return path
+end
+
+function Content.rewrite_image_sources(xhtml, src_map)
+    if not src_map or not next(src_map) then
+        return xhtml
+    end
+    local function replace_src(quote, src)
+        local clean = tostring(src or ""):gsub("&amp;", "&")
+        local key = basename(clean:match("^[^%?#]+") or clean)
+        local href = src_map[key]
+        if href then
+            return "src=" .. quote .. href .. quote
+        end
+        return "src=" .. quote .. src .. quote
+    end
+    xhtml = xhtml:gsub("src=(['\"])(.-)%1", replace_src)
+    return xhtml
+end
+
+function Content.download_chapter_assets(client, book, chapter, used_names)
+    if not chapter or not chapter.tar or chapter.tar == "" then
+        return {}, {}
+    end
+    used_names = used_names or {}
+    local book_id = book.book_id or book.bookId
+    local referer = WeRead.reader_url(book_id, chapter.chapterUid)
+    local tar_url = tostring(chapter.tar)
+    if tar_url:match("^//") then
+        tar_url = "https:" .. tar_url
+    elseif tar_url:match("^/") then
+        tar_url = "https://weread.qq.com" .. tar_url
+    end
+    local raw = client:get_binary(tar_url, { referer = referer })
+    local assets = {}
+    local src_map = {}
+    for entry_index, entry in ipairs(tar_entries(raw)) do
+        local ext, media_type = media_type_for(entry.data)
+        if media_type:match("^image/") then
+            local stem = basename(entry.name)
+            local filename = unique_asset_name(used_names, stem, ext)
+            local href = "images/" .. filename
+            local epub_relative = "../" .. href
+            table.insert(assets, {
+                href = href,
+                media_type = media_type,
+                data = entry.data,
+            })
+            src_map[stem] = epub_relative
+            src_map[filename] = epub_relative
+        end
+    end
+    return assets, src_map
+end
+
+function Content.ensure_reader_state(client, book)
+    local book_id = book.book_id or book.bookId
+    local reader_url = book.reader_url or WeRead.reader_url(book_id)
+    local reader_html = client:get_text(reader_url, { referer = reader_url })
+    local state = Content.extract_reader_state(reader_html)
+    book.book_id = book.book_id or state.book_id or book.bookId
+    book.title = book.title or state.title
+    book.author = book.author or state.author
+    book.psvts = state.psvts or book.psvts
+    book.pclts = state.pclts or book.pclts
+    book.token = state.token or book.token
+    book.reader_url = reader_url
+
+    if not book.psvts then
+        error("reader.psvts not found")
+    end
+    return state
+end
+
+function Content.fetch_catalog(client, book)
+    local book_id = book.book_id or book.bookId
+    local reader_url = book.reader_url or WeRead.reader_url(book_id)
+    local catalog = client:post_json("https://weread.qq.com/web/book/chapterInfos", {
+        bookIds = { tostring(book_id) },
+    }, { referer = reader_url })
+    local chapters = Content.readable_chapters(Content.normalize_chapters(catalog, book_id))
+    book.chapters = chapters
+    return chapters
+end
+
+function Content.fetch_chapter_shard(client, settings, book, chapter, endpoint)
+    if not book.psvts then
+        Content.ensure_reader_state(client, book)
+    end
+    local book_id = book.book_id or book.bookId
+    if not chapter then
+        error("chapter is required")
+    end
+
+    local chapter_url = WeRead.reader_url(book_id, chapter.chapterUid)
+    local params = WeRead.make_content_params(book_id, chapter.chapterUid, book.psvts, { sc = 1 })
+    local text = client:request({
+        url = "https://weread.qq.com" .. endpoint,
+        method = "POST",
+        headers = {
+            ["Content-Type"] = "application/json;charset=UTF-8",
+            ["Origin"] = "https://weread.qq.com",
+            ["Referer"] = chapter_url,
+            ["Cookie"] = require("lib.cookie").to_header(settings:get("cookies", {})),
+        },
+        body = client:json_encode(params),
+    })
+    if text == "{}" then
+        error(endpoint .. " returned empty object")
+    end
+    return text
+end
+
+function Content.fetch_chapter_xhtml(client, settings, book, chapter)
+    return Content.decode_content_shards(
+        Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_0"),
+        Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_1"),
+        Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_3")
+    )
+end
+
+function Content.fetch_chapter_css(client, settings, book, chapter)
+    local ok, css = pcall(function()
+        return Content.decode_content_shard(Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_2"))
+    end)
+    if ok then
+        return css
+    end
+    return nil
+end
+
+function Content.fetch_chapter_epub(client, settings, book, chapter)
+    Content.ensure_reader_state(client, book)
+    local book_id = book.book_id or book.bookId
+    local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
+    local css = Content.fetch_chapter_css(client, settings, book, chapter)
+    local assets = {}
+    local cache = settings:get("cache", {})
+    if cache.download_images then
+        local src_map
+        assets, src_map = Content.download_chapter_assets(client, book, chapter, {})
+        xhtml = Content.rewrite_image_sources(xhtml, src_map)
+    end
+    local path = Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
+    book.cached_chapters = book.cached_chapters or {}
+    book.cached_chapters[tostring(chapter.chapterUid)] = path
+    book.cached_file = path
+    book.chapter_uid = chapter.chapterUid
+    book.chapter_idx = chapter.chapterIdx
+    book.reader_url = book.reader_url or WeRead.reader_url(book_id)
+    return path, chapter
+end
+
+function Content.fetch_chapters_epub(client, settings, book, chapters, options)
+    options = options or {}
+    Content.ensure_reader_state(client, book)
+    local selected = {}
+    local bodies = {}
+    local assets = {}
+    local used_asset_names = {}
+    local cache = settings:get("cache", {})
+    local css
+    for chapter_index, chapter in ipairs(chapters or {}) do
+        if options.progress then
+            options.progress(chapter_index, #chapters, chapter, "text")
+        end
+        local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
+        if not css then
+            css = Content.fetch_chapter_css(client, settings, book, chapter)
+        end
+        if cache.download_images then
+            if options.progress then
+                options.progress(chapter_index, #chapters, chapter, "images")
+            end
+            local chapter_assets, src_map = Content.download_chapter_assets(client, book, chapter, used_asset_names)
+            for asset_index, asset in ipairs(chapter_assets) do
+                table.insert(assets, asset)
+            end
+            xhtml = Content.rewrite_image_sources(xhtml, src_map)
+        end
+        local uid = tostring(chapter.chapterUid or chapter_index)
+        table.insert(selected, chapter)
+        bodies[uid] = xhtml
+    end
+    if #selected == 0 then
+        error("No readable chapter found")
+    end
+    local path = Content.save_book_epub(settings, book, selected, bodies, options.suffix or "book", assets, css)
+    book.cached_chapters = book.cached_chapters or {}
+    for chapter_index, chapter in ipairs(selected) do
+        book.cached_chapters[tostring(chapter.chapterUid or chapter_index)] = path
+    end
+    book.cached_file = path
+    book.reader_url = book.reader_url or WeRead.reader_url(book.book_id or book.bookId)
+    return path, selected
+end
+
+function Content.fetch_first_chapter(client, settings, book)
+    Content.ensure_reader_state(client, book)
+    local chapters = book.chapters or Content.fetch_catalog(client, book)
+    local chapter = Content.first_readable_chapter(chapters)
+    if not chapter then
+        error("No readable chapter found")
+    end
+    return Content.fetch_chapter_epub(client, settings, book, chapter)
+end
+
+return Content
