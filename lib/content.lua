@@ -807,9 +807,52 @@ function Content.fetch_chapter_shard(client, settings, book, chapter, endpoint)
     return text
 end
 
+function Content.txt_to_xhtml(text)
+    text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
+    local parts = {}
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        line = line:match("^(.-)%s*$") or ""
+        if line ~= "" then
+            table.insert(parts, "<p>" .. xml_escape(line) .. "</p>")
+        end
+    end
+    return '<?xml version="1.0" encoding="utf-8"?>\n'
+        .. '<html xmlns="http://www.w3.org/1999/xhtml"><head><title></title></head>\n'
+        .. '<body>\n' .. table.concat(parts, "\n") .. '\n</body></html>'
+end
+
+function Content.fetch_txt_as_xhtml(client, settings, book, chapter)
+    local t0 = Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/t_0")
+    local ok_t1, t1 = pcall(Content.fetch_chapter_shard, client, settings, book, chapter, "/web/book/chapter/t_1")
+    if not ok_t1 then t1 = "" end
+    local plain = Content.decode_content_shards(t0, t1, "")
+    return Content.txt_to_xhtml(plain)
+end
+
 function Content.fetch_chapter_xhtml(client, settings, book, chapter)
+    if book._content_format == "txt" then
+        return Content.fetch_txt_as_xhtml(client, settings, book, chapter)
+    end
+
+    local ok, e0 = pcall(Content.fetch_chapter_shard, client, settings, book, chapter, "/web/book/chapter/e_0")
+
+    if ok and e0:sub(1, 1) == "{" then
+        book._content_format = "txt"
+        return Content.fetch_txt_as_xhtml(client, settings, book, chapter)
+    end
+
+    if not ok then
+        local txt_ok, txt_result = pcall(Content.fetch_txt_as_xhtml, client, settings, book, chapter)
+        if txt_ok then
+            book._content_format = "txt"
+            return txt_result
+        end
+        error(e0)
+    end
+
+    book._content_format = "epub"
     return Content.decode_content_shards(
-        Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_0"),
+        e0,
         Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_1"),
         Content.fetch_chapter_shard(client, settings, book, chapter, "/web/book/chapter/e_3")
     )

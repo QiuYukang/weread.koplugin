@@ -702,18 +702,28 @@ POST https://weread.qq.com/web/book/chapter/e_2
 POST https://weread.qq.com/web/book/chapter/e_3
 ```
 
-TXT-format endpoints found in Web code:
+TXT-format endpoints (web novels, some bookstore books):
 
 ```text
 POST https://weread.qq.com/web/book/chapter/t_0
 POST https://weread.qq.com/web/book/chapter/t_1
 ```
 
-TXT decoding still needs separate validation.
+#### Format detection
+
+Books in WeRead use either EPUB or TXT internal format. The `chapterInfos` response may include a `format` field (`"epub"`), but it can also be absent (observed for TXT books). Reliable detection:
+
+1. POST to `/web/book/chapter/e_0` with standard content params.
+2. If the response starts with `{` and contains `"bookId"`, the book is **TXT format** — the EPUB endpoint returns chapter metadata JSON instead of encoded content. Switch to `t_0`/`t_1`.
+3. If the response starts with a 32-char hex string, the book is **EPUB format** — proceed with `e_0`/`e_1`/`e_3`.
+
+Typical TXT books: web novels (网文), some free bookstore titles with numeric `bookId` and hundreds of short chapters.
+
+Validated: `bookId=32212941` (中医许阳, 780 chapters) — `e_0` returns JSON metadata, `t_0`/`t_1` return valid encoded content.
 
 #### Request body
 
-For `e_0`, `e_1`, `e_3`:
+For EPUB shards `e_0`, `e_1`, `e_3` and TXT shards `t_0`, `t_1`:
 
 ```json
 {
@@ -730,7 +740,7 @@ For `e_0`, `e_1`, `e_3`:
 }
 ```
 
-For `e_2` stylesheet:
+For `e_2` stylesheet (EPUB only):
 
 ```json
 {
@@ -746,6 +756,7 @@ Key discoveries:
 - `sc=1` gives full chapter content.
 - `sc=0` can return only a short preview ending in `...`.
 - `e_2` uses `st=1`; the other shards use `st=0`.
+- `t_0`/`t_1` use the same request body as `e_0`/`e_1`.
 - Sign with the request fields before adding `s`.
 
 #### Signature string
@@ -911,13 +922,22 @@ For EPUB content:
 4. Reverse WeRead's character swaps.
 5. Convert Base64-url to Base64.
 6. Decode bytes and repair UTF-8 sequences.
-7. Result is XHTML or text-like content.
+7. Result is XHTML.
 
-For CSS:
+For TXT content:
+
+1. Remove MD5 prefix from `t_0`, `t_1`.
+2. Concatenate in order: `t_0 + t_1`.
+3. Apply the same decode routine (steps 3–6 above).
+4. Result is plain text with `\r\n` line breaks and full-width space (`　`) indentation.
+5. Convert to XHTML by wrapping non-empty lines in `<p>` tags.
+
+For CSS (EPUB only):
 
 1. Remove MD5 prefix from `e_2`.
 2. Apply the same decode routine to that single payload.
 3. Result is CSS.
+4. TXT-format books have no CSS shard; `e_2` returns `{}`. Use a default CSS.
 
 ### 3.8 Chapter Resource Packages
 
@@ -987,16 +1007,17 @@ GET /web/reader/{_e(bookId)}
 {"bookIds":["<bookId>"]}
 ```
 
-7. For each chapter with `wordCount > 0`:
+7. For the first chapter, probe format:
+   - Fetch `e_0` with `sc=1`, `st=0`.
+   - If response starts with `{` and contains `"bookId"`: book is TXT format, use `t_0`/`t_1` for all chapters.
+   - Otherwise: book is EPUB format, continue with `e_0`/`e_1`/`e_3`.
+8. For each chapter with `wordCount > 0`:
    - Fetch chapter reader HTML with `bookHash + "k" + chapterHash`.
    - Parse fresh `psvts`.
-   - Fetch `e_0`, `e_1`, `e_3` with `sc=1`, `st=0`.
-   - Fetch `e_2` with `sc=1`, `st=1`.
-   - Decode XHTML and CSS.
-   - Download `tar` if present.
-   - Rewrite images.
+   - **EPUB**: Fetch `e_0`, `e_1`, `e_3` (`sc=1`, `st=0`). Fetch `e_2` (`sc=1`, `st=1`). Decode XHTML and CSS. Download `tar` if present. Rewrite images.
+   - **TXT**: Fetch `t_0`, `t_1` (`sc=1`, `st=0`). Decode plain text. Convert to XHTML paragraphs. No CSS shard, no images.
    - Store chapter XHTML and assets.
-8. Build EPUB or KOReader cache.
+9. Build EPUB or KOReader cache.
 
 ### 4.2 KOReader Plugin Strategy
 
@@ -1083,6 +1104,7 @@ Likely causes:
 - `pc` missing or equals stale value.
 - `sc=0` instead of `sc=1`.
 - `e_2` requested with `st=0` instead of `st=1`.
+- Book is TXT format — EPUB endpoints return chapter metadata JSON, not `{}`. Detect by checking if `e_0` response starts with `{` and contains `"bookId"`, then switch to `t_0`/`t_1`.
 - Session lacks entitlement for the chapter.
 - Cookie expired.
 
@@ -1254,7 +1276,6 @@ Validated with `scripts/verify_mp_articles.py`.
 
 ## 7. Known Gaps
 
-- TXT book flow via `t_0`/`t_1` has not been fully validated.
 - Audio/albums are official skill metadata only; no content download flow is documented here.
 - Some WeRead frontend algorithms may change; keep the code modular and easy to update.
 - Use this only for user-authenticated, user-readable content. Do not expose a bulk export flow by default.

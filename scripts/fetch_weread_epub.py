@@ -676,12 +676,23 @@ def reader_url_for(book_id: str, chapter_uid: Optional[Union[int, str]] = None) 
     return base
 
 
+def txt_to_xhtml(text: str) -> str:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    paragraphs = [f"<p>{html.escape(line.rstrip())}</p>" for line in lines if line.strip()]
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><title></title></head>\n'
+        "<body>\n" + "\n".join(paragraphs) + "\n</body></html>"
+    )
+
+
 def fetch_chapter(
     client: WeReadClient,
     *,
     book_id: str,
     chapter: dict[str, Any],
     sleep_seconds: float,
+    content_format: list[str],
 ) -> tuple[str, str, str, list[EpubAsset]]:
     chapter_uid = chapter["chapterUid"]
     title = chapter.get("title") or f"Chapter {chapter_uid}"
@@ -705,12 +716,38 @@ def fetch_chapter(
             time.sleep(sleep_seconds)
         return result
 
+    if content_format[0] == "txt":
+        t0 = post("/web/book/chapter/t_0")
+        t1_text = ""
+        try:
+            t1_text = post("/web/book/chapter/t_1")
+        except ValueError:
+            pass
+        plain = decode_content_shards(t0, t1_text, "")
+        return str(title), txt_to_xhtml(plain), "", []
+
     e0 = post("/web/book/chapter/e_0")
+    if e0.startswith("{") and '"bookId"' in e0:
+        content_format[0] = "txt"
+        t0 = post("/web/book/chapter/t_0")
+        t1_text = ""
+        try:
+            t1_text = post("/web/book/chapter/t_1")
+        except ValueError:
+            pass
+        plain = decode_content_shards(t0, t1_text, "")
+        return str(title), txt_to_xhtml(plain), "", []
+
+    content_format[0] = "epub"
     e1 = post("/web/book/chapter/e_1")
-    e2 = post("/web/book/chapter/e_2", style=True)
     e3 = post("/web/book/chapter/e_3")
     content = decode_content_shards(e0, e1, e3)
-    css = decode_style_shard(e2)
+    css = ""
+    try:
+        e2 = post("/web/book/chapter/e_2", style=True)
+        css = decode_style_shard(e2)
+    except ValueError:
+        pass
     assets, src_map = download_chapter_assets(client, chapter=chapter, referer=referer)
     content = rewrite_image_sources(content, src_map)
     return str(title), content, css, assets
@@ -851,12 +888,14 @@ def main(argv: list[str]) -> int:
 
     fetched: list[tuple[str, str, list[EpubAsset]]] = []
     css = ""
+    content_format: list[str] = ["auto"]
     for index, chapter in enumerate(chapters, start=1):
         title, content, chapter_css, assets = fetch_chapter(
             client,
             book_id=book_id,
             chapter=chapter,
             sleep_seconds=args.sleep,
+            content_format=content_format,
         )
         if chapter_css and not css:
             css = chapter_css
