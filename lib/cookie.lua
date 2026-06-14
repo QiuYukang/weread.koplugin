@@ -20,12 +20,21 @@ function Cookie.extract_from_curl(curl)
         return "", nil
     end
 
-    local cookie = curl:match("%-H%s+['\"][Cc]ookie:%s*(.-)['\"]")
-        or curl:match("%-b%s+['\"](.-)['\"]")
-        or curl:match("%-%-cookie%s+['\"](.-)['\"]")
-    local data = curl:match("%-%-data%-raw%s+['\"](.-)['\"]")
-        or curl:match("%-%-data%s+['\"](.-)['\"]")
-        or curl:match("%-d%s+['\"](.-)['\"]")
+    -- Match the value inside *matching* single/double quotes: capture the opening
+    -- quote and require the same quote to close it (back-reference %1). A plain
+    -- ['\"](.-)['\"] stops at the first internal quote, so a JSON payload like
+    -- --data-raw '{"appId":"…"}' was captured as just "{".
+    local function quoted(pattern)
+        local _opening_quote, value = curl:match(pattern)
+        return value
+    end
+
+    local cookie = quoted("%-H%s+(['\"])[Cc]ookie:%s*(.-)%1")
+        or quoted("%-b%s+(['\"])(.-)%1")
+        or quoted("%-%-cookie%s+(['\"])(.-)%1")
+    local data = quoted("%-%-data%-raw%s+(['\"])(.-)%1")
+        or quoted("%-%-data%s+(['\"])(.-)%1")
+        or quoted("%-d%s+(['\"])(.-)%1")
 
     return cookie or curl, data
 end
