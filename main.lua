@@ -107,10 +107,8 @@ function WeReadPlugin:loadConfigFile()
     end
 
     if curl_payload and curl_payload ~= "" then
-        local parsed_ok, payload = pcall(function()
-            return self.client:json_decode(curl_payload)
-        end)
-        if parsed_ok and type(payload) == "table" then
+        local payload = self.client:parse_read_payload(curl_payload)
+        if payload then
             self.settings:set("curl_payload", payload)
         end
     end
@@ -538,10 +536,8 @@ function WeReadPlugin:showImportCookieDialog()
                         end
                         self.settings:set("cookies", cookies)
                         if curl_data and curl_data ~= "" then
-                            local ok, payload = pcall(function()
-                                return self.client:json_decode(curl_data)
-                            end)
-                            if ok and type(payload) == "table" then
+                            local payload = self.client:parse_read_payload(curl_data)
+                            if payload then
                                 self.settings:set("curl_payload", payload)
                             end
                         end
