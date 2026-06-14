@@ -70,6 +70,35 @@ function Client:json_decode(text)
     return json:decode(text)
 end
 
+--- Parse the --data-raw payload of a /web/book/read cURL into a table.
+-- WeRead's web client occasionally emits unescaped quotes inside string values
+-- (e.g. a book title snippet in "sm"), so the captured payload may not be valid
+-- JSON. In that case, fall back to extracting the scalar fields read-report
+-- needs by pattern matching, instead of silently dropping the whole payload.
+function Client:parse_read_payload(text)
+    if not text or text == "" then
+        return nil
+    end
+    local ok, payload = pcall(function()
+        return self:json_decode(text)
+    end)
+    if ok and type(payload) == "table" then
+        return payload
+    end
+    local fallback = {}
+    fallback.appId = text:match('"appId"%s*:%s*"([^"]*)"')
+    fallback.c     = text:match('"c"%s*:%s*"([^"]*)"')
+    fallback.ci    = tonumber(text:match('"ci"%s*:%s*(%d+)'))
+    fallback.co    = tonumber(text:match('"co"%s*:%s*(%d+)'))
+    fallback.pr    = tonumber(text:match('"pr"%s*:%s*(%d+)'))
+    fallback.ps    = text:match('"ps"%s*:%s*"([^"]*)"')
+    fallback.pc    = text:match('"pc"%s*:%s*"([^"]*)"')
+    if not next(fallback) then
+        return nil
+    end
+    return fallback
+end
+
 function Client:request(opts)
     local body = opts.body
     local response = {}
