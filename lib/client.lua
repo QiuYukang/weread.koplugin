@@ -181,6 +181,27 @@ function Client:get_text(url, opts)
     error(("HTTP %s: %s"):format(tostring(code), text or ""))
 end
 
+function Client:get_public_text(url, opts)
+    opts = opts or {}
+    local text, code, resp_headers = self:request_follow({
+        url = url,
+        method = "GET",
+        headers = {
+            ["Accept"] = opts.accept or "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            ["Referer"] = opts.referer or "https://mp.weixin.qq.com/",
+        },
+    })
+    if code and code >= 200 and code < 300 then
+        return text, {
+            code = code,
+            content_type = header_value(resp_headers, "content-type"),
+            length = #(text or ""),
+            url = url,
+        }
+    end
+    error(("HTTP %s: %s"):format(tostring(code), text and text:sub(1, 200) or ""))
+end
+
 function Client:get_binary(url, opts)
     opts = opts or {}
     local cookies = self.settings:get("cookies", {})
@@ -278,18 +299,25 @@ function Client:get_mp_articles(book_id, max_idx, count, wr_ticket)
     error(("HTTP %s: %s"):format(tostring(code), text or ""))
 end
 
-function Client:get_mp_content(review_id)
+function Client:get_mp_content(review_id, opts)
+    opts = opts or {}
     local url = "https://weread.qq.com/web/mp/content?reviewId="
         .. WeRead.urlencode(review_id)
     local cookies = self.settings:get("cookies", {})
     local headers = {
         ["Accept"] = "text/html,application/xhtml+xml,*/*",
-        ["Referer"] = "https://weread.qq.com/",
+        ["Referer"] = opts.referer or "https://weread.qq.com/",
         ["Cookie"] = Cookie.to_header(cookies),
     }
-    local wrpa = self.settings:get("wr_wrpa", "")
-    if wrpa ~= "" then
-        headers["x-wrpa-0"] = wrpa
+    if not opts.skip_mp_auth_headers then
+        local wr_ticket = self.settings:get("wr_ticket", "")
+        if wr_ticket ~= "" then
+            headers["x-wr-ticket"] = wr_ticket
+        end
+        local wrpa = self.settings:get("wr_wrpa", "")
+        if wrpa ~= "" then
+            headers["x-wrpa-0"] = wrpa
+        end
     end
     local text, code, resp_headers = self:request({
         url = url,
@@ -302,7 +330,12 @@ function Client:get_mp_content(review_id)
         self.settings:flush()
     end
     if code and code >= 200 and code < 300 then
-        return text
+        return text, {
+            code = code,
+            content_type = header_value(resp_headers, "content-type"),
+            length = #(text or ""),
+            url = url,
+        }
     end
     error(("HTTP %s: %s"):format(tostring(code), text and text:sub(1, 200) or ""))
 end

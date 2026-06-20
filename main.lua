@@ -267,11 +267,11 @@ function WeReadPlugin:getSettingsMenuItems()
             end),
         },
         {
-            text = _("Download chapter images"),
+            text = _("Download book/article images"),
             checked_func = function()
                 return self.settings:get("cache").download_images
             end,
-            callback = self:safeCallback(_("Download chapter images"), function()
+            callback = self:safeCallback(_("Download book/article images"), function()
                 local cache = self.settings:get("cache")
                 cache.download_images = not cache.download_images
                 self.settings:set("cache", cache)

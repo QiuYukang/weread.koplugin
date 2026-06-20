@@ -1,6 +1,10 @@
 local Crypto = require("lib.crypto")
 local WeRead = require("lib.weread")
 local bit = require("bit")
+local ok_logger, logger = pcall(require, "logger")
+if not ok_logger then
+    logger = nil
+end
 
 local Content = {}
 
@@ -1023,8 +1027,22 @@ function Content.parse_mp_articles(data)
         for _, sub in ipairs(group.subReviews or {}) do
             local review = sub.review or sub
             local mp = review.mpInfo or {}
+            local review_ids = {}
+            local seen_ids = {}
+            for _, review_id in ipairs({ sub.reviewId, review.reviewId, mp.originalId }) do
+                review_id = tostring(review_id or "")
+                if review_id ~= "" and not seen_ids[review_id] then
+                    seen_ids[review_id] = true
+                    table.insert(review_ids, review_id)
+                end
+            end
             table.insert(articles, {
-                reviewId = review.reviewId or "",
+                reviewId = review.reviewId or sub.reviewId or "",
+                reviewIds = review_ids,
+                originalId = mp.originalId or "",
+                bookId = review.belongBookId or "",
+                sourceUrl = mp.content_url or mp.contentUrl or mp.source_url or mp.sourceUrl or mp.url
+                    or review.content_url or review.contentUrl or review.source_url or review.sourceUrl or review.url or "",
                 title = mp.title or "",
                 pic_url = mp.pic_url or "",
                 createTime = review.createTime or 0,
@@ -1069,22 +1087,64 @@ end
 local function strip_mp_reader_font_styles(html)
     local blocked = {
         ["font"] = true,
-        ["font-size"] = true,
         ["font-family"] = true,
         ["line-height"] = true,
         ["color"] = true,
         ["-webkit-text-fill-color"] = true,
         ["opacity"] = true,
+        ["page-break-before"] = true,
+        ["page-break-after"] = true,
+        ["page-break-inside"] = true,
+        ["break-before"] = true,
+        ["break-after"] = true,
+        ["break-inside"] = true,
         ["text-size-adjust"] = true,
         ["-webkit-text-size-adjust"] = true,
     }
+
+    local function relative_heading_size(value)
+        local lower = tostring(value or ""):lower():gsub("%s*!important%s*$", "")
+        local px = tonumber(lower:match("^%s*([%d%.]+)%s*px%s*$"))
+        if px then
+            return px >= 18 and string.format("%.2fem", px / 16) or nil
+        end
+        local pt = tonumber(lower:match("^%s*([%d%.]+)%s*pt%s*$"))
+        if pt then
+            return pt >= 13.5 and string.format("%.2fem", pt / 12) or nil
+        end
+        local rem = tonumber(lower:match("^%s*([%d%.]+)%s*rem%s*$"))
+        if rem then
+            return rem > 1.05 and string.format("%.2fem", rem) or nil
+        end
+        local em = tonumber(lower:match("^%s*([%d%.]+)%s*em%s*$"))
+        if em then
+            return em > 1.05 and string.format("%.2fem", em) or nil
+        end
+        local percent = tonumber(lower:match("^%s*([%d%.]+)%s*%%%s*$"))
+        if percent then
+            return percent > 105 and string.format("%.0f%%", percent) or nil
+        end
+        local keyword = lower:match("^%s*(.-)%s*$")
+        if keyword == "large" or keyword == "larger" or keyword == "x-large" or keyword == "xx-large" then
+            return keyword
+        end
+        return nil
+    end
 
     return tostring(html or ""):gsub('style=(["\'])(.-)%1', function(quote, style)
         local kept = {}
         for decl in style:gmatch("[^;]+") do
             local name, value = decl:match("^%s*([^:]+)%s*:%s*(.-)%s*$")
-            if name and value and not blocked[name:lower()] then
-                table.insert(kept, name .. ": " .. value)
+            if name and value then
+                local property = name:lower()
+                if property == "font-size" then
+                    local heading_size = relative_heading_size(value)
+                    if heading_size then
+                        table.insert(kept, "font-size: " .. heading_size)
+                    end
+                elseif not blocked[property] then
+                    table.insert(kept, name .. ": " .. value)
+                end
             end
         end
         if #kept == 0 then
@@ -1094,37 +1154,23 @@ local function strip_mp_reader_font_styles(html)
     end)
 end
 
-local function is_blank_mp_fragment(fragment)
-    fragment = tostring(fragment or "")
-    if fragment:match("<%s*[iI][mM][gG][%s>/]") then
-        return false
-    end
-    fragment = fragment:gsub("<[bB][rR]%s*/?%s*>", "")
-    fragment = fragment:gsub("<[^>]->", "")
-    fragment = fragment:gsub("&nbsp;", "")
-    fragment = fragment:gsub("&#160;", "")
-    fragment = fragment:gsub("&#x[aA]0;", "")
-    fragment = fragment:gsub("%s+", "")
-    return fragment == ""
-end
-
 local function strip_blank_mp_blocks(html)
     html = tostring(html or "")
+    html = html:gsub("<mp%-common%-profile[^>]->.-</mp%-common%-profile>", "")
+    html = html:gsub("<mp%-style%-type[^>]->.-</mp%-style%-type>", "")
     html = html:gsub("<[bB][rR]%s*/?%s*>", "<br/>")
+    html = html:gsub("&nbsp;", " ")
+    html = html:gsub("&#160;", " ")
+    html = html:gsub("&#x[aA]0;", " ")
+    html = html:gsub("\194\160", " ")
 
-    for _ = 1, 4 do
-        local changed = false
-        for _, tag in ipairs({ "p", "section", "div" }) do
-            local pattern = "<" .. tag .. "[^>]->(.-)</" .. tag .. ">"
-            html = html:gsub(pattern, function(inner)
-                if is_blank_mp_fragment(inner) then
-                    changed = true
-                    return ""
-                end
-                return nil
-            end)
+    for _ = 1, 12 do
+        local previous = html
+        for _, tag in ipairs({ "span", "p", "section", "div" }) do
+            html = html:gsub("<" .. tag .. "[^>]->%s*<br/>%s*</" .. tag .. ">", "")
+            html = html:gsub("<" .. tag .. "[^>]->%s*</" .. tag .. ">", "")
         end
-        if not changed then
+        if html == previous then
             break
         end
     end
@@ -1233,19 +1279,24 @@ html, body {
   text-size-adjust: 100%;
 }
 body {
-  margin: 5%;
+  margin: 0 !important;
+  padding: 0 !important;
 }
 body * {
   color: inherit !important;
-  font-size: inherit !important;
   font-family: inherit !important;
   line-height: inherit !important;
 }
 img {
-  display: block;
+  display: inline !important;
   max-width: 100%;
   height: auto;
-  margin: 0.8em auto;
+  margin: 0.2em 0 !important;
+  vertical-align: middle;
+  page-break-before: auto !important;
+  page-break-after: auto !important;
+  break-before: auto !important;
+  break-after: auto !important;
 }
 h1 {
   font-size: 1.35em !important;
@@ -1253,8 +1304,7 @@ h1 {
   margin: 0 0 1em;
 }
 p {
-  margin-top: 0.55em;
-  margin-bottom: 0.55em;
+  margin: 0.25em 0 !important;
 }
 </style>
 </head>
@@ -1270,11 +1320,108 @@ end
 
 function Content.fetch_mp_article_html(client, settings, book, article, opts)
     opts = opts or {}
-    local html = client:get_mp_content(article.reviewId)
+    local book_id = article.bookId
+    if not book_id or book_id == "" then
+        book_id = book.book_id or book.bookId
+    end
+    local referer = book_id and book_id ~= "" and WeRead.mp_reader_url(book_id) or "https://weread.qq.com/"
+    local candidate_ids = {}
+    local seen_ids = {}
+    local function add_candidate(review_id)
+        review_id = tostring(review_id or "")
+        if review_id ~= "" and not seen_ids[review_id] then
+            seen_ids[review_id] = true
+            table.insert(candidate_ids, review_id)
+        end
+    end
+    add_candidate(article.reviewId)
+    for _, review_id in ipairs(article.reviewIds or {}) do
+        add_candidate(review_id)
+    end
+    add_candidate(article.originalId)
+    add_candidate(tostring(article.reviewId or ""):match("^MP_WXS_%d+_(.+)$"))
+
+    local html, meta, used_review_id
+    local attempts = {}
+    local function fetch_candidates(prefix, request_opts)
+        for _, review_id in ipairs(candidate_ids) do
+            local ok, candidate_html, candidate_meta = pcall(function()
+                return client:get_mp_content(review_id, {
+                    referer = referer,
+                    skip_mp_auth_headers = request_opts and request_opts.skip_mp_auth_headers,
+                })
+            end)
+            if ok then
+                table.insert(
+                    attempts,
+                    prefix .. review_id .. ":" .. tostring(candidate_meta and candidate_meta.length or #(candidate_html or ""))
+                )
+                if candidate_html and not candidate_html:match("^%s*$") then
+                    html = candidate_html
+                    meta = candidate_meta
+                    used_review_id = review_id
+                    return true
+                end
+                meta = meta or candidate_meta
+            else
+                table.insert(attempts, prefix .. review_id .. ":error")
+            end
+        end
+        return false
+    end
+
+    fetch_candidates("")
+    if not html or html:match("^%s*$") then
+        if logger then
+            logger.info("WeRead: MP content empty, renewing cookie before retry")
+        end
+        local renew_ok = pcall(function()
+            return client:renew_cookie()
+        end)
+        table.insert(attempts, renew_ok and "renew:ok" or "renew:error")
+        if renew_ok then
+            fetch_candidates("renewed:", { skip_mp_auth_headers = true })
+        end
+    end
+
+    local source_url = tostring(article.sourceUrl or "")
+    if (not html or html:match("^%s*$")) and source_url:match("^https?://mp%.weixin%.qq%.com/") then
+        local ok, source_html, source_meta = pcall(function()
+            return client:get_public_text(source_url)
+        end)
+        if ok and source_html and not source_html:match("^%s*$") then
+            html = source_html
+            meta = source_meta
+            used_review_id = "source_url"
+        else
+            table.insert(attempts, "source_url:error")
+        end
+    end
     local body = Content.extract_mp_body(html)
     if not body then
         local preview = tostring(html or ""):sub(1, 300)
-        error("Could not extract article body from HTML:\n" .. preview)
+        local empty_response = not html or html:match("^%s*$") ~= nil
+        if logger then
+            logger.warn(
+                "WeRead: could not extract MP article body:",
+                "reason=", empty_response and "empty_response" or "missing_body",
+                "reviewId=", tostring(article and article.reviewId or ""),
+                "usedReviewId=", tostring(used_review_id or ""),
+                "originalId=", tostring(article and article.originalId or ""),
+                "bookId=", tostring(book_id or ""),
+                "title=", tostring(article and article.title or ""),
+                "html_length=", tostring(meta and meta.length or #(html or "")),
+                "content_type=", tostring(meta and meta.content_type or ""),
+                "referer=", tostring(referer or ""),
+                "attempts=", table.concat(attempts, ","),
+                "has_source_url=", source_url ~= "" and "yes" or "no",
+                "html_preview=", preview
+            )
+        end
+        if empty_response then
+            error("Article content response is empty. See KOReader log for details.", 0)
+        end
+        error("Could not extract article body. See KOReader log for details.", 0)
     end
     local cache = settings:get("cache", {})
     if cache.download_images then
