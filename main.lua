@@ -18,6 +18,7 @@ local I18n = require("lib.i18n")
 local Settings = require("lib.settings")
 local WeRead = require("lib.weread")
 
+-- `_` is the translation function; never reuse it as a loop placeholder in this file.
 local function _(text)
     return I18n.tr(text)
 end
@@ -216,10 +217,9 @@ function WeReadPlugin:getSettingsMenuItems()
             end,
         },
         {
-            text = _("Import cookie/cURL"),
-            keep_menu_open = true,
-            callback = self:safeCallback(_("Import cookie/cURL"), function()
-                self:showImportCookieDialog()
+            text = _("Cache management"),
+            callback = self:safeCallback(_("Cache management"), function()
+                self:showCacheManagement()
             end),
         },
         {
@@ -297,12 +297,6 @@ function WeReadPlugin:getSettingsMenuItems()
                 self:confirmClearAccount()
             end),
         },
-        {
-            text = _("Cache management"),
-            callback = self:safeCallback(_("Cache management"), function()
-                self:showCacheManagement()
-            end),
-        },
     }
 end
 
@@ -337,60 +331,142 @@ function WeReadPlugin:showCacheManagement()
     local books = self.settings:get("books", {})
     local cache_dir = self.settings.cache_dir
     local items = {}
+    local entries = {}
+    local seen_dirs = {}
     local total_size = 0
+    local mp_total_size = 0
 
-    for book_id, book in pairs(books) do
-        if book.cached_file or book.cached_chapters then
-            local book_dir = cache_dir .. "/" .. book_id
-            local size = 0
-            local file_count = 0
-            local ok, iter, dir_obj = pcall(lfs.dir, book_dir)
-            if ok then
-                for entry in iter, dir_obj do
-                    if entry ~= "." and entry ~= ".." then
-                        local attr = lfs.attributes(book_dir .. "/" .. entry)
-                        if attr and attr.mode == "file" then
-                            size = size + (attr.size or 0)
-                            file_count = file_count + 1
-                        end
-                    end
+    local function directory_stats(path)
+        local size = 0
+        local file_count = 0
+        local ok, iter, dir_obj = pcall(lfs.dir, path)
+        if not ok then
+            return size, file_count
+        end
+        for entry in iter, dir_obj do
+            if entry ~= "." and entry ~= ".." then
+                local child = path .. "/" .. entry
+                local attr = lfs.attributes(child)
+                if attr and attr.mode == "file" then
+                    size = size + (attr.size or 0)
+                    file_count = file_count + 1
+                elseif attr and attr.mode == "directory" then
+                    local child_size, child_count = directory_stats(child)
+                    size = size + child_size
+                    file_count = file_count + child_count
                 end
             end
-            if file_count > 0 then
-                total_size = total_size + size
-                local size_str = size < 1024 * 1024
-                    and string.format("%.0f KB", size / 1024)
-                    or string.format("%.1f MB", size / 1024 / 1024)
-                table.insert(items, {
-                    text = book.title or book_id,
-                    post_text = T(_("%1 files, %2"), tostring(file_count), size_str),
-                    callback = self:safeCallback(book.title or book_id, function()
-                        self:confirmClearBookCache(book_id, book.title or book_id)
-                    end),
-                })
+        end
+        return size, file_count
+    end
+
+    local function add_cache_entry(book_id, title, book_dir)
+        if seen_dirs[book_dir] then
+            return
+        end
+        seen_dirs[book_dir] = true
+        local size, file_count = directory_stats(book_dir)
+        if file_count == 0 then
+            return
+        end
+        local is_mp = WeRead.is_mp_book(book_id)
+        total_size = total_size + size
+        if is_mp then
+            mp_total_size = mp_total_size + size
+        end
+        table.insert(entries, {
+            book_id = book_id,
+            title = title or book_id,
+            size = size,
+            file_count = file_count,
+            is_mp = is_mp,
+        })
+    end
+
+    for book_id, book in pairs(books) do
+        add_cache_entry(book_id, book.title, Content.book_cache_dir(self.settings, book_id))
+    end
+
+    local ok, iter, dir_obj = pcall(lfs.dir, cache_dir)
+    if ok then
+        for entry in iter, dir_obj do
+            if entry ~= "." and entry ~= ".." then
+                local path = cache_dir .. "/" .. entry
+                local attr = lfs.attributes(path)
+                if attr and attr.mode == "directory" then
+                    add_cache_entry(entry, entry, path)
+                end
             end
         end
     end
 
+    table.sort(entries, function(a, b)
+        if a.is_mp ~= b.is_mp then
+            return a.is_mp
+        end
+        return tostring(a.title):lower() < tostring(b.title):lower()
+    end)
+
     local total_str = total_size < 1024 * 1024
         and string.format("%.0f KB", total_size / 1024)
         or string.format("%.1f MB", total_size / 1024 / 1024)
+    local mp_total_str = mp_total_size < 1024 * 1024
+        and string.format("%.0f KB", mp_total_size / 1024)
+        or string.format("%.1f MB", mp_total_size / 1024 / 1024)
     table.insert(items, {
-        text = T(_("Clear all cache (%1)"), total_str),
+        text = T(_("[Cleanup] Clear all public account cache (%1)"), mp_total_str),
+        callback = self:safeCallback(_("Clear all public account cache"), function()
+            UIManager:show(ConfirmBox:new{
+                text = _("Clear all public account cache? Downloaded articles and cached article lists will be deleted."),
+                ok_text = _("Clear"),
+                ok_callback = function()
+                    self:clearAllMPCache()
+                    self:refreshCacheManagement(_("Public account cache cleared"))
+                end,
+            })
+        end),
+    })
+    table.insert(items, {
+        text = T(_("[Cleanup] Clear all cache (%1)"), total_str),
+        separator = true,
         callback = self:safeCallback(_("Clear all cache"), function()
             UIManager:show(ConfirmBox:new{
                 text = _("Clear all cache? Downloaded books and articles will be deleted."),
                 ok_text = _("Clear"),
                 ok_callback = function()
                     self:clearAllCache()
-                    self:showTransientInfo(_("Cache cleared"))
-                    self:showCacheManagement()
+                    self:refreshCacheManagement(_("Cache cleared"))
                 end,
             })
         end),
     })
 
-    self:showList(_("Cache management"), items, _("No cached books"))
+    for entry_index, entry in ipairs(entries) do
+        local size_str = entry.size < 1024 * 1024
+            and string.format("%.0f KB", entry.size / 1024)
+            or string.format("%.1f MB", entry.size / 1024 / 1024)
+        table.insert(items, {
+            text = entry.title,
+            post_text = T(_("%1 files, %2"), tostring(entry.file_count), size_str),
+            mandatory = entry.is_mp and _("Public Account") or "",
+            callback = self:safeCallback(entry.title, function()
+                self:confirmClearBookCache(entry.book_id, entry.title)
+            end),
+        })
+    end
+
+    self.cache_menu = self:showList(_("Cache management"), items, _("No cached items"))
+end
+
+function WeReadPlugin:refreshCacheManagement(message)
+    if self.cache_menu then
+        UIManager:close(self.cache_menu)
+        self.cache_menu = nil
+    end
+    self:showCacheManagement()
+    if message then
+        self:showTransientInfo(message)
+    end
 end
 
 function WeReadPlugin:confirmClearBookCache(book_id, title)
@@ -399,22 +475,49 @@ function WeReadPlugin:confirmClearBookCache(book_id, title)
         ok_text = _("Clear"),
         ok_callback = function()
             self:clearBookCache(book_id)
-            self:showTransientInfo(_("Cache cleared"))
-            self:showCacheManagement()
+            self:refreshCacheManagement(_("Cache cleared"))
         end,
     })
 end
 
 function WeReadPlugin:clearBookCache(book_id)
-    local cache_dir = self.settings.cache_dir .. "/" .. book_id
+    local cache_dir = Content.book_cache_dir(self.settings, book_id)
     os.execute("rm -rf " .. string.format("%q", cache_dir))
     local books = self.settings:get("books", {})
     if books[book_id] then
         books[book_id].cached_file = nil
         books[book_id].cached_chapters = nil
+        if WeRead.is_mp_book(book_id) then
+            books[book_id].mp_articles = nil
+            books[book_id].mp_articles_time = nil
+        end
         self.settings:set("books", books)
         self.settings:flush()
     end
+end
+
+function WeReadPlugin:clearAllMPCache()
+    local lfs = require("libs/libkoreader-lfs")
+    local cache_dir = self.settings.cache_dir
+    local ok, iter, dir_obj = pcall(lfs.dir, cache_dir)
+    if ok then
+        for entry in iter, dir_obj do
+            if entry ~= "." and entry ~= ".." and WeRead.is_mp_book(entry) then
+                os.execute("rm -rf " .. string.format("%q", cache_dir .. "/" .. entry))
+            end
+        end
+    end
+    local books = self.settings:get("books", {})
+    for book_id, book in pairs(books) do
+        if WeRead.is_mp_book(book_id) then
+            book.cached_file = nil
+            book.cached_chapters = nil
+            book.mp_articles = nil
+            book.mp_articles_time = nil
+        end
+    end
+    self.settings:set("books", books)
+    self.settings:flush()
 end
 
 function WeReadPlugin:clearAllCache()
@@ -422,9 +525,11 @@ function WeReadPlugin:clearAllCache()
     os.execute("rm -rf " .. string.format("%q", cache_dir))
     os.execute("mkdir -p " .. string.format("%q", cache_dir))
     local books = self.settings:get("books", {})
-    for _, book in pairs(books) do
+    for book_id, book in pairs(books) do
         book.cached_file = nil
         book.cached_chapters = nil
+        book.mp_articles = nil
+        book.mp_articles_time = nil
     end
     self.settings:set("books", books)
     self.settings:flush()
@@ -501,12 +606,14 @@ function WeReadPlugin:showList(title, items, empty_text)
         self:showInfo(empty_text or _("No items."))
         return
     end
-    UIManager:show(Menu:new{
+    local menu = Menu:new{
         title = title,
         item_table = items,
         is_borderless = true,
         title_bar_fm_style = true,
-    })
+    }
+    UIManager:show(menu)
+    return menu
 end
 
 function WeReadPlugin:showImportCookieDialog()
@@ -1076,6 +1183,7 @@ function WeReadPlugin:showMPShelfPage()
 end
 
 function WeReadPlugin:showMPAccount(book)
+    self:rememberMPAccount(book)
     if not self.settings:is_cookie_configured() then
         self:showInfo(_("Import cookie/cURL before loading articles."))
         return
@@ -1087,6 +1195,22 @@ function WeReadPlugin:showMPAccount(book)
         return
     end
     self:fetchMPArticles(book, nil)
+end
+
+function WeReadPlugin:rememberMPAccount(book)
+    local book_id = book.book_id or book.bookId
+    if not book_id then
+        return
+    end
+    local books = self.settings:get("books", {})
+    local record = books[book_id] or {}
+    record.book_id = book_id
+    record.title = book.title or record.title
+    record.author = book.author or record.author
+    record.updated_at = os.time()
+    books[book_id] = record
+    self.settings:set("books", books)
+    self.settings:flush()
 end
 
 function WeReadPlugin:fetchMPArticles(book, wr_ticket)

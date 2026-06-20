@@ -69,6 +69,15 @@ T(_("Template %1"), value)          -- with substitution (ffi/util.template)
 
 Use `_i` (not `_`) in `for _i, item in ipairs(...)` to avoid shadowing the `_()` translation function.
 
+### Menu Maintenance
+
+Whenever a menu item is added, removed, renamed, or moved:
+
+- Update the menu definition in `main.lua`
+- Add, rename, or remove the corresponding translation entry in `lib/i18n.lua`; do not leave unused menu translation keys behind
+- Keep the menu tree in `README.md` in sync
+- Search all three files for the old and new labels before considering the change complete
+
 ## Two API Systems
 
 1. **Gateway API** (official, `Bearer` auth with `api_key`): shelf, search, progress, book info

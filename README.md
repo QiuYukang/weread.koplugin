@@ -160,7 +160,7 @@ curl 'https://weread.qq.com/web/mp/articles?bookId=...' \
 │   └── 上报状态
 └── 设置
     ├── 关于
-    ├── 导入 Cookie/cURL
+    ├── 缓存管理
     ├── 重新加载 config.lua
     ├── 设置官方 API Key
     ├── 立即续期 Cookie
@@ -169,8 +169,7 @@ curl 'https://weread.qq.com/web/mp/articles?bookId=...' \
     ├── 下载书籍/文章图片
     ├── 书架排序
     ├── 账号状态
-    ├── 清除账号数据
-    └── 缓存管理
+    └── 清除账号数据
 ```
 
 ## 文件结构

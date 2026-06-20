@@ -42,6 +42,10 @@ local function basename_safe(value)
     return value
 end
 
+function Content.book_cache_dir(settings, book_id)
+    return settings.cache_dir .. "/" .. basename_safe(book_id)
+end
+
 local function filename_safe(value)
     value = tostring(value or ""):gsub("[%z%c/\\:%*%?\"<>|]", "_")
     value = value:gsub("^%s+", ""):gsub("%s+$", "")
@@ -489,7 +493,7 @@ end
 
 function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     local book_id = book.book_id or book.bookId
-    local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
+    local dir = Content.book_cache_dir(settings, book_id)
     os.execute("mkdir -p " .. string.format("%q", dir))
     local book_title = book.title or "WeRead"
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (chapter.title or tostring(chapter.chapterUid or "chapter"))) .. ".epub"
@@ -560,7 +564,7 @@ end
 
 function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css, cover_data)
     local book_id = book.book_id or book.bookId
-    local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
+    local dir = Content.book_cache_dir(settings, book_id)
     os.execute("mkdir -p " .. string.format("%q", dir))
     local book_title = book.title or "WeRead"
     local path = dir .. "/" .. filename_safe(book_title .. " - " .. (suffix or "book")) .. ".epub"
@@ -1233,7 +1237,7 @@ end
 
 function Content.mp_article_path(settings, book, article)
     local book_id = book.book_id or book.bookId
-    local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
+    local dir = Content.book_cache_dir(settings, book_id)
     local title = filename_safe(article.title or "article")
     return dir .. "/" .. title .. ".html"
 end
@@ -1256,7 +1260,7 @@ end
 
 function Content.save_mp_article_html(settings, book, article, body_html)
     local book_id = book.book_id or book.bookId
-    local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
+    local dir = Content.book_cache_dir(settings, book_id)
     os.execute("mkdir -p " .. string.format("%q", dir))
     local title = article.title or "Article"
     local path = Content.mp_article_path(settings, book, article)
