@@ -1,6 +1,7 @@
 local BD = require("ui/bidi")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Dispatcher = require("dispatcher")
+local NetworkMgr = require("ui/network/manager")
 local DownloadDialog = require("lib.download_dialog")
 local ProgressbarDialog = require("ui/widget/progressbardialog")
 local InfoMessage = require("ui/widget/infomessage")
@@ -338,6 +339,13 @@ function WeReadPlugin:getSettingsMenuItems()
             keep_menu_open = true,
             callback = self:safeCallback(_("Renew cookie now"), function()
                 self:renewCookieWithUI()
+            end),
+        },
+         {
+            text = _("QR code login"),
+            keep_menu_open = true,
+            callback = self:safeCallback(_("QR code login"), function()
+                self:showQRCodeLoginDialog()  
             end),
         },
         {
@@ -744,7 +752,6 @@ function WeReadPlugin:showInputDialog(dialog)
 end
 
 function WeReadPlugin:runNetworkAction(label, action)
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         local ok, result = pcall(action)
         if ok then
@@ -816,6 +823,115 @@ function WeReadPlugin:showImportCookieDialog()
         },
     }
     self:showInputDialog(dialog)
+end
+
+function WeReadPlugin:showQRCodeLoginDialog()
+    NetworkMgr:runWhenOnline(function()
+        local TIMEOUT_SECONDS = 300
+        local POLL_INTERVAL = 1.5
+        
+        local cookies = self.settings:get("cookies", {})
+        cookies = {
+            wr_fp = cookies.wr_fp or self.client:generate_wr_fp(),
+            wr_scaleRatio = "1"
+        }
+        self.settings:set("cookies", cookies)
+        self.settings:flush()
+
+        local ok_url, res = pcall(self.client.get_confirm_url, self.client)
+        if not ok_url or type(res) ~= "table" or not res.url then
+            logger.err(LOG_MODULE, "get_confirm_url failed:", res)
+            self:showInfo(_("Failed to get login UID."))
+            return
+        end
+
+        local uid = res.uid
+        logger.dbg(LOG_MODULE, "UID:", uid)
+
+        local QRMessage = require("ui/widget/qrmessage")
+        local Device = require("device")
+
+        local login_qr = QRMessage:new{
+            text = res.url,
+            width = Device.screen:getWidth(),
+            height = Device.screen:getHeight(),
+            timeout = TIMEOUT_SECONDS
+        }
+
+        UIManager:show(login_qr)
+
+        local qr_closed = false
+        local orig_onClose = login_qr.onClose
+        login_qr.onClose = function(this, ...)
+            qr_closed = true
+            if orig_onClose then return orig_onClose(this, ...) end
+        end
+
+        local start_time = os.time()
+        local cgi_key = self.client:generate_cgi_key()
+
+        local function perform_web_login(ret)
+            local current_cookies = self.settings:get("cookies", {})
+            local fp = current_cookies.wr_fp or self.client:generate_wr_fp()
+            local payload = {
+                vid = ret.vid,
+                skey = ret.skey,
+                code = ret.code,
+                isAutoLogout = 0,
+                pf = 2, cgiKey = cgi_key, fp = fp,
+            }
+            local ok_login, login_res = pcall(self.client.web_login, self.client, payload)
+            local has_login = Cookie.has_login_cookie(self.settings:get("cookies", {}))
+
+            if not (ok_login and has_login) then
+                logger.err(LOG_MODULE, "Weblogin failed: ok =", ok_login, "has_login =", has_login, "error =", login_res)
+                self:showInfo(_("Login failed."))
+                return
+            end
+
+            logger.dbg(LOG_MODULE, "Login success")
+            self:renewCookieWithUI()
+
+            local ok_user, user_info = pcall(self.client.get_user_info, self.client, ret.vid)
+            local msg = _("Login successful.")
+            if ok_user and type(user_info) == "table" then
+                msg = string.format(
+                    _("Login successful.\nNickname: %s City: %s"), 
+                    user_info.name or _("Unknown"), 
+                    user_info.location or _("Unknown")
+                )
+            end
+            self:showInfo(msg)
+
+            if not self.settings:is_api_configured() then
+                local fetch_success, api_response = pcall(self.client.get_skills_key, self.client)
+                if fetch_success and type(api_response) == "table" and api_response.apikey then
+                    self.settings:set("api_key", api_response.apikey)
+                    self.settings:flush()
+                end
+            end
+        end
+
+        local poll_getinfo
+        poll_getinfo = function()
+            if qr_closed then return end
+            if os.time() - start_time > TIMEOUT_SECONDS then
+                UIManager:close(login_qr)
+                self:showInfo(_("Login timeout."))
+                return
+            end
+            local ok, ret = pcall(self.client.get_login_info, self.client, uid, cgi_key)
+            if not (ok and type(ret) == "table" and ret.vid and ret.skey and ret.code) then
+                UIManager:scheduleIn(POLL_INTERVAL, poll_getinfo)
+                return
+            end
+            logger.info(LOG_MODULE, "QR code scanned and confirmed. Logging in...")
+            UIManager:close(login_qr)
+            self:showTransientInfo(_("QR code scanned. Logging in..."), 5)
+            perform_web_login(ret)
+        end
+        UIManager:scheduleIn(POLL_INTERVAL, poll_getinfo)
+    end)
 end
 
 function WeReadPlugin:renewCookieWithUI()
@@ -996,7 +1112,6 @@ function WeReadPlugin:showReadReportBookPicker()
         return
     end
     self:showBusy(_("Loading bookshelf..."))
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         local ok, result = pcall(function()
             return self.client:gateway("/shelf/sync", {})
@@ -1051,7 +1166,6 @@ function WeReadPlugin:showBookshelf()
         return
     end
     self:showBusy(_("Loading bookshelf..."))
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         local ok, result = pcall(function()
             return self.client:gateway("/shelf/sync", {})
@@ -1154,7 +1268,6 @@ function WeReadPlugin:showBookRecord(book)
     end
     local saved = books[book_id] or book
     self:showBusy(_("Loading book info..."))
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         local ok, err = pcall(function()
             local info = self.client:get_book_info(book_id)
@@ -1335,7 +1448,6 @@ function WeReadPlugin:rememberMPAccount(book)
 end
 
 function WeReadPlugin:fetchMPArticles(book, wr_ticket)
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         self:showBusy(_("Loading articles..."))
         local book_id = book.book_id or book.bookId
@@ -1481,7 +1593,6 @@ function WeReadPlugin:downloadMPArticleAndRead(book, article)
         self:showInfo(_("Import cookie/cURL before downloading articles."))
         return
     end
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         self:showBusy(T(_("Downloading article: %1"), article.title or ""))
         local progress_dialog
@@ -1529,7 +1640,6 @@ function WeReadPlugin:loadChapters(book, callback)
         self:showInfo(_("Import cookie/cURL before loading chapters."))
         return
     end
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         self:showBusy(_("Loading chapter list..."))
         local ok, chapters_or_err = pcall(function()
@@ -1595,7 +1705,6 @@ function WeReadPlugin:downloadFirstChapterAndRead(book)
         self:showInfo(_("Import cookie/cURL before downloading book content."))
         return
     end
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         self:showBusy(_("Downloading first chapter, please wait..."))
         local ok, path_or_err, chapter = pcall(function()
@@ -1624,7 +1733,6 @@ function WeReadPlugin:downloadChapterAndRead(book, chapter)
         self:showInfo(_("Import cookie/cURL before downloading book content."))
         return
     end
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         self:showBusy(T(_("Downloading chapter: %1"), chapter.title or tostring(chapter.chapterUid)))
         local ok, path_or_err = pcall(function()
@@ -1684,7 +1792,6 @@ function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix)
         self:showInfo(_("Import cookie/cURL before downloading book content."))
         return
     end
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         local ok_init, err_init = pcall(function()
             Content.ensure_reader_state(self.client, book)
@@ -1880,7 +1987,6 @@ function WeReadPlugin:searchWithUI(keyword)
     if not keyword or keyword == "" then
         return
     end
-    local NetworkMgr = require("ui/network/manager")
     NetworkMgr:runWhenOnline(function()
         local ok, result = pcall(function()
             return self.client:gateway("/store/search", {
