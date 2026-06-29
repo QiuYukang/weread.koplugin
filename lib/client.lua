@@ -1,6 +1,5 @@
 local ltn12 = require("ltn12")
 local socketutil = require("socketutil")
-local socket_url = require("socket.url")
 local http = require("socket.http")
 local Cookie = require("lib.cookie")
 local WeRead = require("lib.weread")
@@ -9,6 +8,9 @@ local ok_json, json = pcall(require, "json")
 if not ok_json then
     ok_json, json = pcall(require, "rapidjson")
 end
+
+local DEFAULT_TIMEOUT_SECONDS = 15
+local unpack_args = unpack or table.unpack
 
 local Client = {}
 Client.__index = Client
