@@ -418,4 +418,85 @@ function Client:report_read(payload, referer)
     })
 end
 
+function Client:get_chapter_underlines(book_id, chapter_uid)
+    if not book_id or tostring(book_id) == "" then
+        return false, nil, "empty book_id"
+    end
+    if not chapter_uid then
+        return false, nil, "empty chapter_uid"
+    end
+
+    local url = string.format(
+        "https://weread.qq.com/web/book/underlines?bookId=%s&chapterUid=%d",
+        tostring(book_id),
+        tonumber(chapter_uid)
+    )
+
+    local ok, text = pcall(function()
+        return self:get_text(url, {
+            accept = "application/json, text/plain, */*",
+            referer = "https://weread.qq.com/web/shelf",
+        })
+    end)
+    if not ok then
+        return false, nil, tostring(text)
+    end
+
+    local pok, parsed = pcall(self.json_decode, self, text)
+    if not pok or type(parsed) ~= "table" then
+        return false, nil, "underlines: invalid JSON"
+    end
+    return true, parsed
+end
+
+function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
+    if not book_id or tostring(book_id) == "" then
+        return false, nil, "empty book_id"
+    end
+    if not chapter_uid then
+        return false, nil, "empty chapter_uid"
+    end
+    if type(ranges) ~= "table" or #ranges == 0 then
+        return true, { reviews = {} }
+    end
+
+    local BATCH_SIZE = 5
+    local all_reviews = {}
+    local socket_ok, socket = pcall(require, "socket")
+
+    for batch_start = 1, #ranges, BATCH_SIZE do
+        local batch = {}
+        for index = batch_start, math.min(batch_start + BATCH_SIZE - 1, #ranges) do
+            batch[#batch + 1] = {
+                range = ranges[index],
+                maxIdx = 0,
+                count = 30,
+                synckey = 0,
+            }
+        end
+
+        local ok, result = pcall(function()
+            return self:post_json("https://weread.qq.com/web/book/readReviews", {
+                bookId = tostring(book_id),
+                chapterUid = chapter_uid,
+                reviews = batch,
+            }, {
+                referer = "https://weread.qq.com/web/shelf",
+            })
+        end)
+
+        if ok and type(result) == "table" and type(result.reviews) == "table" then
+            for _, review in ipairs(result.reviews) do
+                all_reviews[#all_reviews + 1] = review
+            end
+        end
+
+        if batch_start + BATCH_SIZE <= #ranges and socket_ok and socket.sleep then
+            socket.sleep(0.3)
+        end
+    end
+
+    return true, { reviews = all_reviews }
+end
+
 return Client
