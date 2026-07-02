@@ -18,6 +18,7 @@ local Crypto = require("lib.crypto")
 local I18n = require("lib.i18n")
 local Settings = require("lib.settings")
 local WeRead = require("lib.weread")
+local ThoughtPopup = require("lib.thought_popup")
 
 -- `_` is the translation function; never reuse it as a loop placeholder in this file.
 local function _(text)
@@ -111,6 +112,8 @@ function WeReadPlugin:init()
     if rr.enabled and rr.mode == "manual" and rr.book_id ~= "" and not rr.report_on_open then
         self:startReadReport(true)
     end
+    ThoughtPopup.init()
+    self._reader_session_gen = 0
     logger.info(LOG_MODULE, "initialized:", "version=", self.version)
 end
 
@@ -2004,7 +2007,7 @@ function WeReadPlugin:showCurrentBookDetails()
 end
 
 function WeReadPlugin:showNotes()
-    self:showInfo(_("Read-only WeRead notes are planned for V1 after the book list screen is connected."))
+    self:showInfo(_("Underlines and thoughts are embedded in cached EPUBs. Tap the star marker while reading to open a thought popup."))
 end
 
 function WeReadPlugin:onShowWeRead()
@@ -2049,15 +2052,245 @@ function WeReadPlugin:onWeReadSyncProgress()
     })
 end
 
+
+function WeReadPlugin:_teardownThoughtInterception()
+    if self._thought_interception_setup and self.ui then
+        self.ui:clearTouchZones({ "weread_thought_tap" })
+        self._thought_interception_setup = nil
+    end
+    ThoughtPopup.closeVisible()
+    ThoughtPopup.cancelPrewarm()
+    self._thought_popup_open = nil
+    self._current_thought_popup = nil
+    self._thought_html_cache = nil
+    self._thought_highlight_active = nil
+end
+
+function WeReadPlugin:_setupThoughtInterception()
+    local Device = require("device")
+    if not Device:isTouchDevice() then
+        return
+    end
+    if not self.ui or self._thought_interception_setup then
+        return
+    end
+
+    self.ui:registerTouchZones({
+        {
+            id = "weread_thought_tap",
+            ges = "tap",
+            screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 },
+            overrides = { "tap_link" },
+            handler = function(ges)
+                return self:_onThoughtTap(ges)
+            end,
+        },
+    })
+    self._thought_interception_setup = true
+end
+
+function WeReadPlugin:_clearThoughtHighlight(document)
+    if not self._thought_highlight_active then
+        return
+    end
+    pcall(function()
+        document:highlightXPointer()
+    end)
+    self._thought_highlight_active = nil
+    UIManager:setDirty(self.dialog, "ui")
+end
+
+function WeReadPlugin:_getThoughtPopupLayoutParams()
+    if not self.ui or not self.ui.document then
+        return nil
+    end
+
+    local Screen = require("device").screen
+    local document = self.ui.document
+
+    local font_face = self.ui.font and self.ui.font.font_face
+    if not font_face then
+        font_face = G_reader_settings:readSetting("cre_font")
+    end
+
+    local font_size = G_reader_settings:readSetting("footnote_popup_absolute_font_size")
+    local font_size_scaled
+    if font_size then
+        font_size_scaled = Screen:scaleBySize(font_size)
+    else
+        local relative = G_reader_settings:readSetting("footnote_popup_relative_font_size") or -2
+        local doc_font_size = (document.configurable and document.configurable.font_size) or 18
+        font_size_scaled = Screen:scaleBySize(doc_font_size) + relative
+    end
+
+    return {
+        doc_font_name = font_face,
+        doc_font_size = font_size_scaled,
+        doc_margins = document:getPageMargins(),
+        height_ratio = 0.35,
+    }
+end
+
+function WeReadPlugin:_showThoughtPopup(html, link, session_gen)
+    if session_gen and session_gen ~= self._reader_session_gen then
+        self._thought_popup_open = nil
+        return
+    end
+    if type(html) ~= "string" or html == "" then
+        self._thought_popup_open = nil
+        return
+    end
+
+    local Screen = require("device").screen
+    local document = self.ui.document
+    if link.from_xpointer then
+        local ok = pcall(function()
+            document:highlightXPointer()
+            document:highlightXPointer(link.from_xpointer)
+        end)
+        if ok then
+            self._thought_highlight_active = true
+            UIManager:setDirty(self.dialog, "partial")
+        end
+    end
+
+    local params = self:_getThoughtPopupLayoutParams()
+    if not params then
+        self._thought_popup_open = nil
+        return
+    end
+
+    ThoughtPopup.preloadFonts(params.doc_font_name)
+
+    local ok, popup = pcall(function()
+        return ThoughtPopup.show({
+            html = html,
+            doc_font_name = params.doc_font_name,
+            doc_font_size = params.doc_font_size,
+            doc_margins = params.doc_margins,
+            height_ratio = params.height_ratio,
+            dialog = self.dialog,
+            close_callback = function(footnote_height)
+                self._thought_popup_open = nil
+                self._current_thought_popup = nil
+                if self._thought_highlight_active then
+                    local highlight_page = document:getCurrentPage()
+                    local clear_gen = self._reader_session_gen or 0
+                    local clear_highlight = function()
+                        if clear_gen ~= self._reader_session_gen then
+                            return
+                        end
+                        document:highlightXPointer()
+                        if document:getCurrentPage() == highlight_page then
+                            UIManager:setDirty(self.dialog, "ui")
+                        end
+                    end
+                    self._thought_highlight_active = nil
+                    local footnote_top_y = Screen:getHeight() - footnote_height
+                    if link.link_y and link.link_y > footnote_top_y then
+                        UIManager:scheduleIn(0.5, clear_highlight)
+                    else
+                        clear_highlight()
+                    end
+                end
+            end,
+        })
+    end)
+
+    if not ok then
+        logger.warn(LOG_MODULE, "thought popup failed:", popup)
+        self._thought_popup_open = nil
+        self:_clearThoughtHighlight(document)
+        return
+    end
+
+    self._current_thought_popup = popup
+end
+
+function WeReadPlugin:_onThoughtTap(ges)
+    if not self.ui or not self.ui.document or not self.ui.link then
+        return false
+    end
+    if not self:detectWeReadBook() then
+        return false
+    end
+
+    local link = self.ui.link:getLinkFromGes(ges)
+    if not link or not link.xpointer then
+        return false
+    end
+
+    local html
+    local cache = self._thought_html_cache
+    if cache and cache[link.xpointer] ~= nil then
+        local cached = cache[link.xpointer]
+        if cached == false then
+            return false
+        end
+        html = cached
+    else
+        html = self.ui.document:getHTMLFromXPointer(link.xpointer, 0x1001, true)
+        if type(html) ~= "string" or not html:find("weread%-thought") then
+            self._thought_html_cache = self._thought_html_cache or {}
+            self._thought_html_cache[link.xpointer] = false
+            return false
+        end
+        self._thought_html_cache = self._thought_html_cache or {}
+        self._thought_html_cache[link.xpointer] = html
+    end
+
+    if self._thought_popup_open then
+        return true
+    end
+    self._thought_popup_open = true
+    local session_gen = self._reader_session_gen or 0
+    UIManager:nextTick(function()
+        if session_gen ~= self._reader_session_gen then
+            self._thought_popup_open = nil
+            return
+        end
+        if not self.ui or not self.ui.document then
+            self._thought_popup_open = nil
+            return
+        end
+        self:_showThoughtPopup(html, link, session_gen)
+    end)
+    return true
+end
+
 function WeReadPlugin:onReaderReady()
+    self._reader_session_gen = (self._reader_session_gen or 0) + 1
+    self:_teardownThoughtInterception()
+
+    local weread_book_id = self:detectWeReadBook()
+    if weread_book_id then
+        self:_setupThoughtInterception()
+        UIManager:nextTick(function()
+            if not self.ui or not self.ui.document then
+                return
+            end
+            local params = self:_getThoughtPopupLayoutParams()
+            if not params then
+                return
+            end
+            ThoughtPopup.preloadFonts(params.doc_font_name)
+            ThoughtPopup.prewarm({
+                doc_font_name = params.doc_font_name,
+                doc_font_size = params.doc_font_size,
+                doc_margins = params.doc_margins,
+                height_ratio = params.height_ratio,
+                dialog = self.dialog,
+            })
+        end)
+    end
+
     local rr = self.settings:get("read_report")
     if rr.mode == "auto" and rr.enabled then
-        local book_id = self:detectWeReadBook()
-        if book_id then
-            self._auto_report_book_id = book_id
+        if weread_book_id then
+            self._auto_report_book_id = weread_book_id
             local books = self.settings:get("books", {})
-            local book_record = books[book_id]
-            self._auto_report_book_title = book_record and book_record.title or book_id
+            local book_record = books[weread_book_id]
+            self._auto_report_book_title = book_record and book_record.title or weread_book_id
             self:startReadReport(true)
             self:showTransientInfo(T(_("Reading time report started: %1"), self._auto_report_book_title), 2)
         else
@@ -2069,6 +2302,9 @@ function WeReadPlugin:onReaderReady()
 end
 
 function WeReadPlugin:onCloseDocument()
+    self._reader_session_gen = (self._reader_session_gen or 0) + 1
+    self:_teardownThoughtInterception()
+
     local rr = self.settings:get("read_report")
     if rr.mode == "auto" then
         self._auto_report_book_id = nil
