@@ -1,5 +1,6 @@
 local Crypto = require("lib.crypto")
 local WeRead = require("lib.weread")
+local Thoughts = require("lib.thoughts")
 local bit = require("bit")
 local ok_logger, logger = pcall(require, "logger")
 if not ok_logger then
@@ -915,11 +916,20 @@ function Content.fetch_chapter_css(client, settings, book, chapter)
     return nil
 end
 
+
+local function apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
+    local book_id = book.book_id or book.bookId
+    local chapter_uid = chapter and chapter.chapterUid
+    local processed, annotation_css = Thoughts.apply(client, settings, book_id, chapter_uid, xhtml)
+    return processed, Thoughts.merge_css(css, annotation_css)
+end
+
 function Content.fetch_chapter_epub(client, settings, book, chapter)
     Content.ensure_reader_state(client, book)
     local book_id = book.book_id or book.bookId
     local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
     local css = Content.fetch_chapter_css(client, settings, book, chapter)
+    xhtml, css = apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
     local assets = {}
     local cache = settings:get("cache", {})
     if cache.download_book_images then
@@ -949,6 +959,7 @@ function Content.fetch_single_chapter_content(client, settings, book, chapter, s
     if not state.css then
         state.css = Content.fetch_chapter_css(client, settings, book, chapter)
     end
+    xhtml, state.css = apply_chapter_annotations(client, settings, book, chapter, xhtml, state.css)
     local chapter_assets = {}
     local cache = settings:get("cache", {})
     if cache.download_book_images then
@@ -984,6 +995,7 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
         if not css then
             css = Content.fetch_chapter_css(client, settings, book, chapter)
         end
+        xhtml, css = apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
         if cache.download_book_images then
             if options.progress then
                 options.progress(chapter_index, #chapters, chapter, "images")
