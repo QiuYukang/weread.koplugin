@@ -47,6 +47,29 @@ function Content.book_cache_dir(settings, book_id)
     return settings.cache_dir .. "/" .. basename_safe(book_id)
 end
 
+-- Resolve where a book's files actually live. The stored cached_file/chapter
+-- paths are absolute and were written under the download root in effect at the
+-- time; the current cache_dir may differ (the user changed it since). Prefer the
+-- directory of a stored path so deletion and stats hit the real files instead of
+-- recomputing a path under the new root, which would orphan the old files.
+function Content.book_resolved_dir(settings, book_id, book)
+    local function dirname(path)
+        if type(path) == "string" then
+            return path:match("^(.*)/[^/]+$")
+        end
+    end
+    local dir = book and dirname(book.cached_file)
+    if not dir and book and type(book.cached_chapters) == "table" then
+        for _i, chapter_path in pairs(book.cached_chapters) do
+            dir = dirname(chapter_path)
+            if dir then
+                break
+            end
+        end
+    end
+    return dir or Content.book_cache_dir(settings, book_id)
+end
+
 local function filename_safe(value)
     value = tostring(value or ""):gsub("[%z%c/\\:%*%?\"<>|]", "_")
     value = value:gsub("^%s+", ""):gsub("%s+$", "")
