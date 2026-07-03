@@ -29,93 +29,6 @@ local VerticalGroup = require("ui/widget/verticalgroup")
 local VerticalSpan = require("ui/widget/verticalspan")
 local Screen = Device.screen
 local logger = require("logger")
-local time = require("ui/time")
-
--- ============================================================================
--- 性能监控模块
--- ============================================================================
-local PerfMonitor = {
-    enabled = false,
-    stats = {
-        popup_create_count = 0,
-        popup_reuse_count = 0,
-        render_count = 0,
-        total_create_time_ms = 0,
-        total_render_time_ms = 0,
-        last_create_time_ms = 0,
-        last_render_time_ms = 0,
-        avg_create_time_ms = 0,
-        avg_render_time_ms = 0,
-    },
-}
-
-function PerfMonitor:enable()
-    self.enabled = true
-end
-
-function PerfMonitor:disable()
-    self.enabled = false
-end
-
-function PerfMonitor:startTimer()
-    if not self.enabled then return nil end
-    return time.now()
-end
-
-function PerfMonitor:endTimer(start_time)
-    if not self.enabled or not start_time then return 0 end
-    return time.to_ms(time.now() - start_time)
-end
-
-function PerfMonitor:recordCreate(duration_ms)
-    if not self.enabled then return end
-    self.stats.popup_create_count = self.stats.popup_create_count + 1
-    self.stats.total_create_time_ms = self.stats.total_create_time_ms + duration_ms
-    self.stats.last_create_time_ms = duration_ms
-    self.stats.avg_create_time_ms = self.stats.total_create_time_ms / self.stats.popup_create_count
-end
-
-function PerfMonitor:recordReuse()
-    if not self.enabled then return end
-    self.stats.popup_reuse_count = self.stats.popup_reuse_count + 1
-end
-
-function PerfMonitor:recordRender(duration_ms)
-    if not self.enabled then return end
-    self.stats.render_count = self.stats.render_count + 1
-    self.stats.total_render_time_ms = self.stats.total_render_time_ms + duration_ms
-    self.stats.last_render_time_ms = duration_ms
-    self.stats.avg_render_time_ms = self.stats.total_render_time_ms / self.stats.render_count
-end
-
-function PerfMonitor:getStats()
-    return {
-        create_count = self.stats.popup_create_count,
-        reuse_count = self.stats.popup_reuse_count,
-        reuse_rate = self.stats.popup_create_count > 0
-            and (self.stats.popup_reuse_count / (self.stats.popup_create_count + self.stats.popup_reuse_count) * 100)
-            or 0,
-        avg_create_ms = self.stats.avg_create_time_ms,
-        avg_render_ms = self.stats.avg_render_time_ms,
-    }
-end
-
-function PerfMonitor:logStats()
-    local s = self:getStats()
-    logger.info(string.format(
-        "weread: thought popup perf stats - creates: %d, reuses: %d (%.1f%%), avg_create: %.0fms, avg_render: %.0fms",
-        s.create_count, s.reuse_count, s.reuse_rate, s.avg_create_ms, s.avg_render_ms
-    ))
-end
-
-function PerfMonitor:reset()
-    self.stats.popup_create_count = 0
-    self.stats.popup_reuse_count = 0
-    self.stats.render_count = 0
-    self.stats.total_create_time_ms = 0
-    self.stats.total_render_time_ms = 0
-end
-
 -- ============================================================================
 -- 字体预加载模块
 -- ============================================================================
@@ -425,8 +338,6 @@ local ThoughtPopupWidget = InputContainer:extend{
 }
 
 function ThoughtPopupWidget:init()
-    local start_time = PerfMonitor:startTimer()
-
     self.height_ratio = math.max(0.1, math.min(0.9, self.height_ratio or 0.35))
     self.width = Screen:getWidth()
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
@@ -459,28 +370,11 @@ function ThoughtPopupWidget:init()
         }
     end
 
-    local t0 = PerfMonitor:startTimer()
     self.html = prepareHTML(self.html)
-    logger.info(string.format("weread: thought popup timing | prepareHTML: %.0fms", PerfMonitor:endTimer(t0)))
-
-    t0 = PerfMonitor:startTimer()
     local css = CSSCache:getFullCSS(self.doc_font_name, self.doc_margins, self.css)
-    logger.info(string.format("weread: thought popup timing | getFullCSS: %.0fms", PerfMonitor:endTimer(t0)))
-
-    t0 = PerfMonitor:startTimer()
     self.htmlwidget = createScrollHtmlWidget(self.html, css, self.doc_font_size,
         self.doc_margins, self.height_ratio, self.dialog)
-    logger.info(string.format("weread: thought popup timing | createScrollHtml: %.0fms", PerfMonitor:endTimer(t0)))
-
-    t0 = PerfMonitor:startTimer()
     self:_buildLayout()
-    logger.info(string.format("weread: thought popup timing | _buildLayout: %.0fms", PerfMonitor:endTimer(t0)))
-
-    pcall(function()
-        local duration = PerfMonitor:endTimer(start_time)
-        PerfMonitor:recordCreate(duration)
-        logger.info(string.format("weread: thought popup timing | TOTAL create: %.0fms", duration))
-    end)
 end
 
 function ThoughtPopupWidget:onShow()
@@ -490,7 +384,6 @@ function ThoughtPopupWidget:onShow()
 end
 
 function ThoughtPopupWidget:_reopen(opts)
-    local t0 = PerfMonitor:startTimer()
     self.html = prepareHTML(opts.html)
     if opts.css then self.css = opts.css end
     self.doc_font_name = opts.doc_font_name or self.doc_font_name
@@ -500,27 +393,16 @@ function ThoughtPopupWidget:_reopen(opts)
     self.dialog = opts.dialog or self.dialog
     self.close_callback = opts.close_callback
     self.height = math.floor(Screen:getHeight() * self.height_ratio)
-    logger.info(string.format("weread: thought popup timing | reopen-prepareHTML: %.0fms", PerfMonitor:endTimer(t0)))
 
-    t0 = PerfMonitor:startTimer()
     if self.htmlwidget then
         self.htmlwidget:free()
         self.htmlwidget = nil
     end
-    logger.info(string.format("weread: thought popup timing | reopen-free: %.0fms", PerfMonitor:endTimer(t0)))
 
-    t0 = PerfMonitor:startTimer()
     local css = CSSCache:getFullCSS(self.doc_font_name, self.doc_margins, self.css)
-    logger.info(string.format("weread: thought popup timing | reopen-getFullCSS: %.0fms", PerfMonitor:endTimer(t0)))
-
-    t0 = PerfMonitor:startTimer()
     self.htmlwidget = createScrollHtmlWidget(self.html, css, self.doc_font_size,
         self.doc_margins, self.height_ratio, self.dialog)
-    logger.info(string.format("weread: thought popup timing | reopen-createScrollHtml: %.0fms", PerfMonitor:endTimer(t0)))
-
-    t0 = PerfMonitor:startTimer()
     self:_buildLayout()
-    logger.info(string.format("weread: thought popup timing | reopen-_buildLayout: %.0fms", PerfMonitor:endTimer(t0)))
 end
 
 function ThoughtPopupWidget:_buildLayout()
@@ -623,9 +505,6 @@ function M.init(opts)
     opts = opts or {}
     FontPreloader:init()
     CSSCache:init()
-    if opts.perf_monitor then
-        PerfMonitor:enable()
-    end
     logger.info("weread: thought popup module initialized")
 end
 
@@ -687,31 +566,16 @@ local ShowState = {
     generation = 0,
 }
 
-local function showPopup(popup, defer_show, show_gen)
-    if defer_show then
-        -- 仅 AI 问书：与 Trapper:reset 错开一帧，避免同帧多次 forceRePaint 撕裂
-        UIManager:nextTick(function()
-            if show_gen ~= ShowState.generation then return end
-            if popup ~= _pooled_popup then return end
-            UIManager:show(popup)
-        end)
-    else
-        UIManager:show(popup)
-    end
-end
-
 function M.show(opts)
     if type(opts.html) ~= "string" or opts.html == "" then
         error("thought popup: invalid html")
     end
 
     ShowState.generation = ShowState.generation + 1
-    local show_gen = ShowState.generation
 
     if _pooled_popup then
         _pooled_popup:_reopen(opts)
-        PerfMonitor:recordReuse()
-        showPopup(_pooled_popup, opts.defer_show, show_gen)
+        UIManager:show(_pooled_popup)
         return _pooled_popup
     end
 
@@ -727,7 +591,7 @@ function M.show(opts)
     }
 
     _pooled_popup = popup
-    showPopup(popup, opts.defer_show, show_gen)
+    UIManager:show(popup)
     return popup
 end
 
@@ -737,25 +601,9 @@ function M.closeVisible()
     end
 end
 
-function M.getPerfStats()
-    return PerfMonitor:getStats()
-end
-
 function M.getPoolStats()
     local has_active = _pooled_popup ~= nil
     return { pool_size = has_active and 1 or 0, max_size = 1, has_active = has_active }
-end
-
-function M.logStats()
-    PerfMonitor:logStats()
-end
-
-function M.setPerfMonitor(enabled)
-    if enabled then
-        PerfMonitor:enable()
-    else
-        PerfMonitor:disable()
-    end
 end
 
 function M.clearCaches()
@@ -780,7 +628,6 @@ function M.cleanup()
 end
 
 function M.reset()
-    PerfMonitor:reset()
     M.clearCaches()
     M.cancelPrewarm()
 end
