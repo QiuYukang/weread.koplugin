@@ -1,5 +1,4 @@
 local Annotations = require("lib.annotations")
-local Content = require("lib.content")
 
 local ok_logger, logger = pcall(require, "logger")
 if not ok_logger then
@@ -10,6 +9,14 @@ local LOG_MODULE = "[WeRead]"
 
 local Thoughts = {}
 
+local function basename_safe(value)
+    value = tostring(value or ""):gsub("[^%w%._-]", "_")
+    if value == "" then
+        value = "unknown"
+    end
+    return value
+end
+
 local function log_info(...)
     if logger then
         logger.info(LOG_MODULE, ...)
@@ -17,7 +24,7 @@ local function log_info(...)
 end
 
 function Thoughts.cache_dir(settings, book_id)
-    return Content.book_cache_dir(settings, book_id) .. "/thoughts"
+    return settings.cache_dir .. "/" .. basename_safe(book_id) .. "/thoughts"
 end
 
 function Thoughts.cache_path(settings, book_id, chapter_uid)
