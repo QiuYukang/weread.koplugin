@@ -360,9 +360,12 @@ local function swap_positions(encoded)
     local m = length - n - 2
     local step = #tostring(m)
     local i = 1
-    while #result < 10 and i + step < #tmp do
+    while #result < 10 and i + step - 1 < #tmp do
         table.insert(result, (tonumber(tmp:sub(i, i + step - 1)) or 0) % m)
-        table.insert(result, (tonumber(tmp:sub(i + 1, i + step)) or 0) % m)
+        local end2 = math.min(i + step, #tmp)
+        if i + 1 <= #tmp then
+            table.insert(result, (tonumber(tmp:sub(i + 1, end2)) or 0) % m)
+        end
         i = i + step
     end
     return result
