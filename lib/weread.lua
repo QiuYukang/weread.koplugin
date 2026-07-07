@@ -188,4 +188,12 @@ function WeRead.mp_reader_url(book_id)
     return "https://weread.qq.com/web/mp/reader/" .. WeRead.e(book_id)
 end
 
+--- Upgrade WeRead CDN cover URLs to the higher-resolution t9 token.
+function WeRead.normalize_cover_url(url)
+    if type(url) ~= "string" or url == "" then
+        return url
+    end
+    return url:gsub("/t%d+_", "/t9_")
+end
+
 return WeRead

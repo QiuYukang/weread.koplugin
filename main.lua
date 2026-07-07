@@ -1991,8 +1991,9 @@ function WeReadPlugin:_downloadStep(dl)
 
     if dl.index > dl.total then
         local cover_data
-        if dl.book.cover then
-            pcall(function() cover_data = self.client:get_binary(dl.book.cover) end)
+        local cover_url = WeRead.normalize_cover_url(dl.book.cover)
+        if cover_url and cover_url ~= "" then
+            pcall(function() cover_data = self.client:get_binary(cover_url) end)
         end
         local ok, path = pcall(function()
             return Content.save_book_epub(
