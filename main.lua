@@ -289,6 +289,12 @@ function WeReadPlugin:getMainMenuItems()
             end,
         },
         {
+            text = _("检查更新"),
+            callback = self:safeCallback(_("检查更新"), function()
+                self:showInfo(_("OTA 更新入口已添加。\n\n当前版本暂不执行自动下载。\n下一步可以接入 GitHub Releases 或 manifest.json。"))
+            end),
+        },
+        {
             text = T(_("About (v%1)"), self.version),
             callback = function()
                 UIManager:show(InfoMessage:new{
