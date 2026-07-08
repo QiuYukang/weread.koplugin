@@ -183,7 +183,6 @@ local zh = {
     ["Loading book info..."] = "正在加载书籍信息...",
     ["Book info"] = "书籍信息",
     ["Clear book cache"] = "清除本书缓存",
-    ["Bookshelf sort order"] = "书架排序",
     ["Sort"] = "排序",
     ["Sort by"] = "排序方式",
     ["%1 \u{25BE}"] = "%1 \u{25BE}",

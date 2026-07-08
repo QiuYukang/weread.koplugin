@@ -474,12 +474,6 @@ function WeReadPlugin:getSettingsMenuItems()
             end,
         },
         {
-            text = _("Bookshelf sort order"),
-            sub_item_table_func = function()
-                return self:getShelfSortMenuItems()
-            end,
-        },
-        {
             text = _("Account management"),
             sub_item_table_func = function()
                 return {
@@ -673,32 +667,6 @@ function WeReadPlugin:remapCachedPath(path, dst)
         return path
     end
     return dst .. "/" .. name
-end
-
-function WeReadPlugin:getShelfSortMenuItems()
-    local sort_options = {
-        { key = "time_desc", label = _("Last read time (newest first)") },
-        { key = "time_asc",  label = _("Last read time (oldest first)") },
-        { key = "name_asc",  label = _("Title A-Z") },
-        { key = "name_desc", label = _("Title Z-A") },
-        { key = "default",   label = _("Default order") },
-    }
-    local items = {}
-    for _i, opt in ipairs(sort_options) do
-        table.insert(items, {
-            text = opt.label,
-            checked_func = function()
-                return self.settings:get("shelf").sort_order == opt.key
-            end,
-            callback = function()
-                local shelf = self.settings:get("shelf")
-                shelf.sort_order = opt.key
-                self.settings:set("shelf", shelf)
-                self.settings:flush()
-            end,
-        })
-    end
-    return items
 end
 
 local SHELF_SORT_OPTIONS = {
