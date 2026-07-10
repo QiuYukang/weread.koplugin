@@ -47,6 +47,18 @@ local function display_error(err)
     return text
 end
 
+local function file_exists(path)
+    if type(path) ~= "string" or path == "" then
+        return false
+    end
+    local file = io.open(path, "rb")
+    if not file then
+        return false
+    end
+    file:close()
+    return true
+end
+
 local function config_auth_fingerprint(config)
     local parts = {}
     for _, key in ipairs({ "curl", "cookie", "mp_curl", "wr_ticket", "wr_wrpa" }) do
@@ -858,6 +870,7 @@ function WeReadPlugin:clearBookCache(book_id)
         self.settings:set("books", books)
         self.settings:flush()
     end
+    self:refreshShelfCacheIndicators()
 end
 
 function WeReadPlugin:clearAllMPCache()
@@ -877,6 +890,7 @@ function WeReadPlugin:clearAllMPCache()
     end
     self.settings:set("books", books)
     self.settings:flush()
+    self:refreshShelfCacheIndicators()
 end
 
 function WeReadPlugin:clearAllCache()
@@ -891,6 +905,7 @@ function WeReadPlugin:clearAllCache()
     end
     self.settings:set("books", books)
     self.settings:flush()
+    self:refreshShelfCacheIndicators()
 end
 
 function WeReadPlugin:showInfo(text)
@@ -1352,26 +1367,46 @@ end
 function WeReadPlugin:showShelfPage()
     local books = self.shelf_books or {}
     local sort_order = self.settings:get("shelf").sort_order
+    local saved_books = self.settings:get("books", {})
     books = sortBooks(books, sort_order)
     local items = {}
     for _i, book in ipairs(books) do
+        local book_id = book.book_id or book.bookId
+        local saved = book_id and saved_books[book_id]
+        local is_cached = saved and file_exists(saved.cached_file)
         local right_text
         if book.finishReading == 1 then
             right_text = _("Done")
-        elseif book.readUpdateTime and book.readUpdateTime > 0 then
-            right_text = os.date("%Y-%m-%d", book.readUpdateTime)
         else
             right_text = ""
         end
         table.insert(items, {
             text = book.title or book.bookId or _("Untitled"),
-            mandatory = right_text,
+            post_text = right_text,
+            mandatory = is_cached and _("Cached") or "",
+            mandatory_func = function()
+                local current = self._shelf_saved_books and self._shelf_saved_books[book_id]
+                return current and file_exists(current.cached_file) and _("Cached") or ""
+            end,
             callback = self:safeCallback(book.title or book.bookId or _("Untitled"), function()
                 self:showBookRecord(book)
             end),
         })
     end
-    self:showList(_("WeRead Bookshelf"), items, _("Your WeRead shelf is empty."))
+    self._shelf_saved_books = saved_books
+    self.shelf_menu = self:showList(_("WeRead Bookshelf"), items, _("Your WeRead shelf is empty."))
+end
+
+function WeReadPlugin:refreshShelfCacheIndicators()
+    self._shelf_saved_books = self.settings:get("books", {})
+    if self.shelf_menu and type(self.shelf_menu.updateItems) == "function" then
+        local ok, err = pcall(function()
+            self.shelf_menu:updateItems(nil, true)
+        end)
+        if not ok then
+            logger.warn(LOG_MODULE, "refresh shelf cache indicators failed:", log_error(err))
+        end
+    end
 end
 
 function WeReadPlugin:showBookRecord(book)
@@ -1863,6 +1898,7 @@ function WeReadPlugin:downloadFirstChapterAndRead(book)
             self.settings:set("books", books)
             self.settings:flush()
         end
+        self:refreshShelfCacheIndicators()
         self:closeBusy()
         self:openFile(path_or_err)
     end)
@@ -1891,6 +1927,7 @@ function WeReadPlugin:downloadChapterAndRead(book, chapter)
             self.settings:set("books", books)
             self.settings:flush()
         end
+        self:refreshShelfCacheIndicators()
         self:closeBusy()
         self:openFile(path_or_err)
     end)
@@ -1990,6 +2027,15 @@ function WeReadPlugin:_downloadStep(dl)
     end
 
     if dl.index > dl.total then
+        if #dl.selected == 0 then
+            if dl.progress_dialog then
+                dl.progress_dialog:close()
+                dl.progress_dialog = nil
+            end
+            logger.err(LOG_MODULE, "book download failed: no chapters downloaded")
+            self:showInfo(_("No chapters were downloaded."))
+            return
+        end
         local cover_data
         local cover_url = WeRead.normalize_cover_url(dl.book.cover)
         if cover_url and cover_url ~= "" then
@@ -2020,6 +2066,7 @@ function WeReadPlugin:_downloadStep(dl)
             self.settings:set("books", books)
             self.settings:flush()
         end
+        self:refreshShelfCacheIndicators()
         if not ok then
             logger.err(LOG_MODULE, "save downloaded book failed:", log_error(path))
             self:showInfo(T(_("Download failed:\n%1"), display_error(path)))
@@ -2035,8 +2082,17 @@ function WeReadPlugin:_downloadStep(dl)
         else
             logger.info(LOG_MODULE, "book download completed:", "chapters=", tostring(#dl.selected))
         end
+        local completion_text
+        if #dl.failed > 0 then
+            completion_text = T(
+                _("Downloaded %1 chapters; %2 failed.\n\nBook saved:\n%3\n\nRead now?"),
+                tostring(#dl.selected), tostring(#dl.failed), path
+            )
+        else
+            completion_text = T(_("Downloaded %1 chapters.\n\nBook saved:\n%2\n\nRead now?"), tostring(#dl.selected), path)
+        end
         UIManager:show(ConfirmBox:new{
-            text = T(_("Downloaded %1 chapters.\n\nBook saved:\n%2\n\nRead now?"), tostring(#dl.selected), path),
+            text = completion_text,
             ok_text = _("Read now"),
             ok_callback = self:safeCallback(_("Read now"), function()
                 self:openFile(path)
@@ -2204,15 +2260,15 @@ function WeReadPlugin:parseReaderURLWithUI(url)
             return _("Reader HTML loaded, but bookId was not found.")
         end
         local books = self.settings:get("books", {})
-        books[book_id] = {
-            book_id = book_id,
-            title = title,
-            reader_url = url,
-            psvts = psvts,
-            pclts = pclts,
-            token = token,
-            updated_at = os.time(),
-        }
+        local record = books[book_id] or {}
+        record.book_id = book_id
+        record.title = title
+        record.reader_url = url
+        record.psvts = psvts
+        record.pclts = pclts
+        record.token = token
+        record.updated_at = os.time()
+        books[book_id] = record
         self.settings:set("books", books)
         self.settings:flush()
         return T(_("Reader URL parsed.\nBook: %1\nbookId: %2"), title, book_id)
@@ -2275,6 +2331,34 @@ end
 -- makes ReaderRolling repeatedly prompt for a full document reload.
 local ANNOTATION_HIDE_CSS =
     ".wr-underline{border-bottom:0 !important;padding-bottom:0 !important;} .wr-star{font-size:0 !important;}"
+
+-- Apply the initial hidden state before KOReader renders the document. Doing
+-- this from onReaderReady starts partial rerendering; its seamless reload then
+-- creates a new plugin instance and repeats the same rerender forever.
+function WeReadPlugin:onReadSettings()
+    if not self.ui or not self.ui.document or not self:detectWeReadBook() then
+        return
+    end
+    if self.settings:get("cache").show_annotations ~= false then
+        return
+    end
+    local typeset = self.ui.typeset
+    if not typeset or not typeset.css then
+        logger.warn(LOG_MODULE, "onReadSettings: typeset stylesheet unavailable")
+        return
+    end
+    local tweaks = ""
+    local styletweak = self.ui.styletweak
+    if styletweak and type(styletweak.getCssText) == "function" then
+        tweaks = styletweak:getCssText() or ""
+    end
+    local ok, err = pcall(function()
+        self.ui.document:setStyleSheet(typeset.css, tweaks .. "\n" .. ANNOTATION_HIDE_CSS)
+    end)
+    if not ok then
+        logger.warn(LOG_MODULE, "initial annotation visibility failed:", err)
+    end
+end
 
 -- Reapply the current annotation visibility preference to the open WeRead book.
 -- Show=true reapplies the base stylesheet + user tweaks (revealing baked-in
@@ -2538,7 +2622,6 @@ function WeReadPlugin:onReaderReady()
             if not self.ui or not self.ui.document then
                 return
             end
-            self:applyAnnotationVisibility()
             if not show_annotations then
                 return
             end
