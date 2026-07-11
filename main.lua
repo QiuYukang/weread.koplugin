@@ -727,12 +727,15 @@ function WeReadPlugin:saveShelfFilters()
     self.settings:flush()
 end
 
-function WeReadPlugin:bookMatchesFilters(book)
-    local filters = self.shelf_filters
+function WeReadPlugin:bookMatchesFilters(book, saved_books, downloaded_cache)
+    local filters = self.shelf_filters or {}
     if filters.reading == "finished" and book.finishReading ~= 1 then return false end
     if filters.reading == "unfinished" and book.finishReading == 1 then return false end
-    if filters.download == "downloaded" and not self:isBookDownloaded(book) then return false end
-    if filters.download == "not_downloaded" and self:isBookDownloaded(book) then return false end
+    if filters.download then
+        local is_downloaded = self:isBookDownloaded(book, saved_books, downloaded_cache)
+        if filters.download == "downloaded" and not is_downloaded then return false end
+        if filters.download == "not_downloaded" and is_downloaded then return false end
+    end
     return true
 end
 
@@ -819,10 +822,20 @@ function WeReadPlugin:showShelfFilterOptions(on_changed)
     UIManager:show(dialog)
 end
 
-function WeReadPlugin:isBookDownloaded(book)
+function WeReadPlugin:isBookDownloaded(book, saved_books, downloaded_cache)
     local book_id = book.book_id or book.bookId
-    local record = self.settings:get("books", {})[book_id]
-    return record ~= nil and record.cached_file ~= nil
+    if not book_id then
+        return false
+    end
+    if downloaded_cache and downloaded_cache[book_id] ~= nil then
+        return downloaded_cache[book_id]
+    end
+    local record = (saved_books or self.settings:get("books", {}))[book_id]
+    local is_downloaded = record ~= nil and file_exists(record.cached_file)
+    if downloaded_cache then
+        downloaded_cache[book_id] = is_downloaded
+    end
+    return is_downloaded
 end
 
 function WeReadPlugin:shelfToolbarItems(with_filters, refresh)
@@ -1510,23 +1523,40 @@ function WeReadPlugin:showShelfPage()
         return
     end
     local menu, buildItems
-    local function refresh() menu:switchItemTable(nil, buildItems()) end
+    local function refresh()
+        menu:switchItemTable(nil, buildItems())
+    end
     buildItems = function()
         local items = self:shelfToolbarItems(true, refresh)
         local sorted = sortBooks(books, self.settings:get("shelf").sort_order)
+        local saved_books = self.settings:get("books", {})
+        local downloaded_cache = {}
+        self._shelf_saved_books = saved_books
         for _i, book in ipairs(sorted) do
-            if self:bookMatchesFilters(book) then
+            if self:bookMatchesFilters(book, saved_books, downloaded_cache) then
+                local book_id = book.book_id or book.bookId
+                local is_cached = self:isBookDownloaded(book, saved_books, downloaded_cache)
                 local right_text
-                if book.finishReading == 1 then
-                    right_text = _("Done")
-                elseif book.readUpdateTime and book.readUpdateTime > 0 then
+                if book.readUpdateTime and book.readUpdateTime > 0 then
                     right_text = os.date("%Y-%m-%d", book.readUpdateTime)
+                elseif book.finishReading == 1 then
+                    right_text = _("Done")
                 else
                     right_text = ""
                 end
+                local function rightStatus(cached)
+                    if cached then
+                        return right_text ~= "" and "✓  " .. right_text or "✓"
+                    end
+                    return right_text
+                end
                 table.insert(items, {
                     text = book.title or book.bookId or _("Untitled"),
-                    mandatory = right_text,
+                    mandatory = rightStatus(is_cached),
+                    mandatory_func = function()
+                        local current = self._shelf_saved_books and self._shelf_saved_books[book_id]
+                        return rightStatus(current and file_exists(current.cached_file))
+                    end,
                     callback = self:safeCallback(book.title or book.bookId or _("Untitled"), function()
                         self:showBookRecord(book)
                     end),
@@ -1536,6 +1566,18 @@ function WeReadPlugin:showShelfPage()
         return items
     end
     menu = self:showList(_("WeRead Bookshelf"), buildItems(), _("Your WeRead shelf is empty."))
+    self.shelf_menu = menu
+    self._shelf_refresh = refresh
+end
+
+function WeReadPlugin:refreshShelfCacheIndicators()
+    self._shelf_saved_books = self.settings:get("books", {})
+    if self.shelf_menu and self._shelf_refresh then
+        local ok, err = pcall(self._shelf_refresh)
+        if not ok then
+            logger.warn(LOG_MODULE, "refresh shelf cache indicators failed:", log_error(err))
+        end
+    end
 end
 
 function WeReadPlugin:showBookRecord(book)
