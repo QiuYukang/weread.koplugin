@@ -79,7 +79,7 @@ end
 local function merge_req_opts(default_opts, user_opts)
     default_opts = default_opts or {}
     if not user_opts then 
-        return deepcopy(default_opts) 
+        return deepcopy(default_opts)
     end
     local result = deepcopy(default_opts)
     for k, v in pairs(user_opts) do
@@ -99,6 +99,15 @@ local function merge_req_opts(default_opts, user_opts)
         end
     end 
     return result
+end
+
+local function is_weread_url(url)
+    local authority = tostring(url or ""):match("^https?://([^/]+)")
+    if not authority then
+        return false
+    end
+    local host = authority:lower():gsub(":%d+$", "")
+    return host == "weread.qq.com" or host:sub(-#".weread.qq.com") == ".weread.qq.com"
 end
 
 function Client:new(settings)
@@ -135,8 +144,9 @@ function Client:request(opts)
         ["User-Agent"] = WeRead.USER_AGENT,
         ["Accept"] = "application/json, text/plain, */*"
     }
+    local is_handle_cookie = not opts.skip_cookie and is_weread_url(opts.url)
 
-    if not opts.skip_cookie then
+    if is_handle_cookie then
         local cookies = self.settings:get("cookies", {})
         local cookie_header = Cookie.to_header(cookies)
         if cookie_header ~= "" then 
@@ -170,7 +180,7 @@ function Client:request(opts)
     if opts.timeout then socketutil:reset_timeout() end
 
     if not opts.sink then response = table.concat(response) end
-    if not opts.skip_cookie then
+    if is_handle_cookie then
         local set_cookie = header_value(resp_headers, "set-cookie")
         if set_cookie then
             local cookies = self.settings:get("cookies", {})
@@ -272,20 +282,16 @@ function Client:renew_cookie()
 end
 
 function Client:gateway(api_name, params)
-    local payload = {
+    local payload = merge_req_opts({
         api_name = api_name,
         skill_version = (params and params.skill_version) or WeRead.SKILL_VERSION
-    }
-    if params then
-        for k, v in pairs(params) do 
-            payload[k] = v 
-        end
-    end
+    }, params) 
+    
     local api_key = self.settings:get("api_key", "")
     if api_key == "" then
         error("WeRead API key is not configured")
     end
-    return self:post_json("https://i.weread.qq.com/api/agent/gateway", params, {
+    return self:post_json("https://i.weread.qq.com/api/agent/gateway", payload, {
         skip_cookie = true,
         headers = {
             ["Authorization"] = "Bearer " .. api_key,
@@ -491,22 +497,10 @@ function Client:get_chapter_underlines(book_id, chapter_uid)
     return true, result
 end
 
-function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
-    if not book_id or tostring(book_id) == "" then
-        return false, nil, "empty book_id"
-    end
-    if not chapter_uid then
-        return false, nil, "empty chapter_uid"
-    end
-    if type(ranges) ~= "table" or #ranges == 0 then
-        return true, { reviews = {} }
-    end
-
+function Client:build_chapter_review_batches(ranges)
     local BATCH_SIZE = 5
-    local all_reviews = {}
-    local socket_ok, socket = pcall(require, "socket")
-
-    for batch_start = 1, #ranges, BATCH_SIZE do
+    local batches = {}
+    for batch_start = 1, #(ranges or {}), BATCH_SIZE do
         local batch = {}
         for index = batch_start, math.min(batch_start + BATCH_SIZE - 1, #ranges) do
             batch[#batch + 1] = {
@@ -516,22 +510,56 @@ function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
                 synckey = 0,
             }
         end
+        batches[#batches + 1] = batch
+    end
+    return batches
+end
 
-        local ok, result = pcall(function()
-            return self:gateway("/book/readreviews", {
-                bookId = tostring(book_id),
-                chapterUid = chapter_uid,
-                reviews = batch,
-            })
-        end)
+function Client:get_chapter_reviews_batch(book_id, chapter_uid, batch)
+    if not book_id or tostring(book_id) == "" then
+        return false, nil, "empty book_id"
+    end
+    if not chapter_uid then
+        return false, nil, "empty chapter_uid"
+    end
+    if type(batch) ~= "table" or #batch == 0 then
+        return true, { reviews = {} }
+    end
 
+    local ok, result = pcall(function()
+        return self:gateway("/book/readreviews", {
+            bookId = tostring(book_id),
+            chapterUid = chapter_uid,
+            reviews = batch,
+        })
+    end)
+    if not ok then
+        return false, nil, tostring(result)
+    end
+    if type(result) ~= "table" or type(result.reviews) ~= "table" then
+        return false, nil, "readreviews: gateway returned invalid data"
+    end
+    return true, result
+end
+
+function Client:get_chapter_reviews(book_id, chapter_uid, ranges)
+    if type(ranges) ~= "table" or #ranges == 0 then
+        return true, { reviews = {} }
+    end
+
+    local all_reviews = {}
+    local batches = self:build_chapter_review_batches(ranges)
+    local socket_ok, socket = pcall(require, "socket")
+
+    for batch_index, batch in ipairs(batches) do
+        local ok, result = self:get_chapter_reviews_batch(book_id, chapter_uid, batch)
         if ok and type(result) == "table" and type(result.reviews) == "table" then
             for _, review in ipairs(result.reviews) do
                 all_reviews[#all_reviews + 1] = review
             end
         end
 
-        if batch_start + BATCH_SIZE <= #ranges and socket_ok and socket.sleep then
+        if batch_index < #batches and socket_ok and socket.sleep then
             socket.sleep(0.3)
         end
     end

@@ -31,7 +31,7 @@
 
 **书籍管理**
 
-- 书架支持多种排序方式（最后阅读时间、书名、默认顺序）
+- 书架支持多种排序方式（最后阅读时间、书名、默认顺序）与筛选（已读完/未读完、已下载/未下载，两组可组合）
 - 书籍详情页展示作者、出版社、评分、字数、阅读进度等信息
 - EPUB 自动嵌入封面图片
 - 缓存管理：查看/清理单本或全部缓存
@@ -42,6 +42,16 @@
 - [ ] 阅读进度双向同步（KOReader 位置 ↔ 微信读书进度映射）
 - [ ] 当前书籍详情页（阅读中展示微信读书元数据）
 - [ ] 独立的标注/笔记浏览界面（书签、热门划线聚合查看；阅读时查看划线和想法已支持，见「功能 → 书籍」）
+
+## 贡献 / Contributing
+
+欢迎提交 issue 和 PR。提交前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+Issues and PRs are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting.
+
+Bug 反馈请提供清晰的复现步骤或截图、KOReader 日志、插件版本和 KOReader 版本；PR 请说明解决的问题或新增的特性，并按模板填写测试方式和截图。
+
+For bug reports, include clear reproduction steps or screenshots, KOReader logs, plugin version, and KOReader version. For PRs, describe the problem fixed or feature added, and fill in the testing and screenshot sections in the template.
 
 ## 安装
 
@@ -178,7 +188,6 @@ curl 'https://weread.qq.com/web/mp/articles?bookId=...' \
 │   │   ├── 书籍图片（默认开启）
 │   │   ├── 公众号文章图片（默认关闭）
 │   │   └── 划线和想法（默认关闭）
-│   ├── 书架排序
 │   └── 账号管理
 │       ├── 账号状态
 │       └── 清除账号数据

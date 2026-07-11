@@ -4,6 +4,7 @@ local CenterContainer = require("ui/widget/container/centercontainer")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
+local Geom = require("ui/geometry")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local ProgressWidget = require("ui/widget/progresswidget")
 local Size = require("ui/size")
@@ -35,7 +36,14 @@ function DownloadDialog:init()
         bold = true,
         max_width = width,
     }
-    table.insert(vertical_group, self.title_widget)
+    self.title_container = CenterContainer:new{
+        dimen = Geom:new{
+            w = width,
+            h = self.title_widget:getSize().h,
+        },
+        self.title_widget,
+    }
+    table.insert(vertical_group, self.title_container)
 
     if self.progress_max and self.progress_max > 0 then
         self.progress_bar = ProgressWidget:new{
@@ -80,6 +88,15 @@ function DownloadDialog:reportProgress(progress)
     local elapsed = now - self.last_redraw_time_ms
     if self.progress_bar.percentage >= 1 or elapsed >= self.refresh_time_seconds * 1000 * 1000 then
         self.last_redraw_time_ms = now
+        UIManager:setDirty(self, function() return "fast", self.dimen end)
+        UIManager:forceRePaint()
+    end
+end
+
+function DownloadDialog:setTitle(title)
+    self.title = title or ""
+    if self.title_widget and self.title_widget.setText then
+        self.title_widget:setText(self.title)
         UIManager:setDirty(self, function() return "fast", self.dimen end)
         UIManager:forceRePaint()
     end

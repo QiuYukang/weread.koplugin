@@ -80,6 +80,36 @@ function Thoughts.is_download_enabled(settings)
     return cache.download_underlines_and_thoughts == true
 end
 
+function Thoughts.fetch_underlines(client, settings, book_id, chapter_uid)
+    if not Thoughts.is_download_enabled(settings) then
+        return true, nil, {}
+    end
+    if not settings:is_cookie_configured() then
+        return false, nil, {}, "cookie not configured"
+    end
+    local ok, data, err = client:get_chapter_underlines(book_id, chapter_uid)
+    if not ok or type(data) ~= "table" then
+        return false, nil, {}, err or "no underline data"
+    end
+    data.chapterUid = chapter_uid
+    return true, data, Thoughts.collect_ranges(data)
+end
+
+function Thoughts.apply_data(settings, book_id, chapter_uid, xhtml, underlines_data, reviews)
+    if type(underlines_data) ~= "table" then
+        return xhtml, ""
+    end
+    if type(reviews) == "table" and #reviews > 0 then
+        Thoughts.save_cache(settings, book_id, chapter_uid, reviews)
+    end
+    underlines_data.chapterUid = chapter_uid
+    local processed, annotation_css = Annotations.process(xhtml, underlines_data, reviews)
+    if processed ~= xhtml then
+        log_info("injected underlines for chapter:", chapter_uid)
+    end
+    return processed, annotation_css or ""
+end
+
 function Thoughts.apply(client, settings, book_id, chapter_uid, xhtml)
     if type(xhtml) ~= "string" or xhtml == "" then
         return xhtml, ""
@@ -94,28 +124,22 @@ function Thoughts.apply(client, settings, book_id, chapter_uid, xhtml)
         return xhtml, ""
     end
 
-    local ok_ul, ul_data, err_ul = client:get_chapter_underlines(book_id, chapter_uid)
+    local ok_ul, ul_data, ranges, err_ul = Thoughts.fetch_underlines(
+        client, settings, book_id, chapter_uid
+    )
     if not ok_ul or type(ul_data) ~= "table" then
         log_info("skip underlines:", err_ul or "no data")
         return xhtml, ""
     end
 
-    local ranges = Thoughts.collect_ranges(ul_data)
     local thought_reviews
     if #ranges > 0 then
         local ok_tr, tr_data = client:get_chapter_reviews(book_id, chapter_uid, ranges)
         if ok_tr and type(tr_data) == "table" and #(tr_data.reviews or {}) > 0 then
             thought_reviews = tr_data.reviews
-            Thoughts.save_cache(settings, book_id, chapter_uid, thought_reviews)
         end
     end
-
-    ul_data.chapterUid = chapter_uid
-    local processed, annotation_css = Annotations.process(xhtml, ul_data, thought_reviews)
-    if processed ~= xhtml then
-        log_info("injected underlines for chapter:", chapter_uid)
-    end
-    return processed, annotation_css or ""
+    return Thoughts.apply_data(settings, book_id, chapter_uid, xhtml, ul_data, thought_reviews)
 end
 
 function Thoughts.merge_css(base_css, annotation_css)
