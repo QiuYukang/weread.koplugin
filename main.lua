@@ -2531,24 +2531,8 @@ function WeReadPlugin:myOnEndOfBook(status_self)
     local books = self.settings:get("books", {})
     local book = books[book_id]
     local file = self.ui.document and self.ui.document.file
-    local current_idx, current_ch
-    if book and file and book.chapters then
-        for uid, path in pairs(book.cached_chapters or {}) do
-            if path == file then
-                local target_uid = tonumber(uid)
-                for i, ch in ipairs(book.chapters) do
-                    if ch.chapterUid == target_uid then
-                        current_idx = i
-                        current_ch = ch
-                        break
-                    end
-                end
-                break
-            end
-        end
-    end
-
-    local next_ch = current_idx and book.chapters[current_idx + 1]
+    local current_idx, current_ch, is_full_book = self:getChapterInfoFromFile(book, file)
+    local next_ch = (not is_full_book) and current_idx and book.chapters[current_idx + 1]
 
     if settings == "next_file" then
         if next_ch then
@@ -2562,11 +2546,14 @@ function WeReadPlugin:myOnEndOfBook(status_self)
             self:showInfo(_("You have reached the last chapter."))
         end
         return true
+    elseif settings == "pop-up" then
+        -- For "pop-up" action, show our beautifully pure WeRead dialog instead of native dialog
+        if self:showEndOfBookDialog(book_id) then
+            return true
+        end
     end
 
-    -- For "pop-up" action, show our beautifully pure WeRead dialog instead of native dialog
-    self:showEndOfBookDialog(book_id)
-    return true
+    return self._orig_onEndOfBook(status_self)
 end
 
 function WeReadPlugin:onReaderReady()
@@ -2787,25 +2774,19 @@ function WeReadPlugin:doReadReport()
     end
 end
 
+-- Returns true if the custom dialog was successfully displayed, or false if
+-- the dialog could not be built (e.g., missing chapter info for MP articles),
+-- allowing the caller to fall back to the native end-of-book handler.
 function WeReadPlugin:showEndOfBookDialog(book_id)
     local file_path = self.ui.document and self.ui.document.file
-    if not file_path then return end
+    if not file_path then return false end
 
     local books = self.settings:get("books", {})
     local book = books[book_id]
-    if not book or not book.chapters then return end
+    if not book or not book.chapters then return false end
 
-    -- To distinguish single chapter from full book:
-    local mapped_count = 0
-    local current_uid = nil
-    if book.cached_chapters then
-        for uid, path in pairs(book.cached_chapters) do
-            if path == file_path then
-                mapped_count = mapped_count + 1
-                current_uid = uid
-            end
-        end
-    end
+    local current_idx, current_ch, is_full_book = self:getChapterInfoFromFile(book, file_path)
+    local next_chapter = (not is_full_book) and current_idx and book.chapters[current_idx + 1]
 
     local ButtonDialog = require("ui/widget/buttondialog")
     local buttons = {}
@@ -2835,34 +2816,24 @@ function WeReadPlugin:showEndOfBookDialog(book_id)
     table.insert(buttons, row1)
 
     -- Next Chapter button (only if it's a single chapter file and there is a next chapter)
-    if mapped_count == 1 and current_uid then
-        local next_chapter = nil
-        for i, chapter in ipairs(book.chapters) do
-            if tostring(chapter.chapterUid) == current_uid then
-                next_chapter = book.chapters[i + 1]
-                break
-            end
-        end
-
-        if next_chapter then
-            local row2 = {
-                {
-                    text = _("WeRead: Next chapter"),
-                    callback = function()
-                        UIManager:close(dialog)
-                        UIManager:scheduleIn(0, function()
-                            local cached = book.cached_chapters and book.cached_chapters[tostring(next_chapter.chapterUid)]
-                            if cached then
-                                self:openFile(cached)
-                            else
-                                self:downloadChapterAndRead(book, next_chapter)
-                            end
-                        end)
-                    end
-                }
+    if next_chapter then
+        local row2 = {
+            {
+                text = _("WeRead: Next chapter"),
+                callback = function()
+                    UIManager:close(dialog)
+                    UIManager:scheduleIn(0, function()
+                        local cached = book.cached_chapters and book.cached_chapters[tostring(next_chapter.chapterUid)]
+                        if cached then
+                            self:openFile(cached)
+                        else
+                            self:downloadChapterAndRead(book, next_chapter)
+                        end
+                    end)
+                end
             }
-            table.insert(buttons, row2)
-        end
+        }
+        table.insert(buttons, row2)
     end
 
     -- Cancel button in a separate row
@@ -2876,11 +2847,50 @@ function WeReadPlugin:showEndOfBookDialog(book_id)
     })
 
     dialog = ButtonDialog:new{
-        title = _("WeRead: Reached end of book"),
+        title = _("WeRead: Reached end of chapter"),
         buttons = buttons,
     }
 
     UIManager:show(dialog)
+    return true
+end
+
+-- Retrieves chapter information for the given file path.
+--
+-- Parameters:
+--   book: The book object from settings containing chapters and cached_chapters.
+--   file_path: The absolute path of the currently open document.
+--
+-- Returns:
+--   current_idx (number or nil): The index of the current chapter within book.chapters, if it's a single chapter file.
+--   current_ch (table or nil): The chapter object of the current chapter, if it's a single chapter file.
+--   is_full_book (boolean): True if the file maps to multiple chapters (e.g. a combined EPUB), false otherwise.
+function WeReadPlugin:getChapterInfoFromFile(book, file_path)
+    if not book or not file_path or not book.chapters or not book.cached_chapters then
+        return nil, nil, false
+    end
+
+    local mapped_count = 0
+    local current_uid = nil
+    for uid, path in pairs(book.cached_chapters) do
+        if path == file_path then
+            mapped_count = mapped_count + 1
+            current_uid = uid
+        end
+    end
+
+    local is_full_book = (mapped_count > 1)
+
+    if mapped_count == 1 and current_uid then
+        local target_uid = tonumber(current_uid)
+        for i, ch in ipairs(book.chapters) do
+            if ch.chapterUid == target_uid then
+                return i, ch, is_full_book
+            end
+        end
+    end
+
+    return nil, nil, is_full_book
 end
 
 function WeReadPlugin:onFlushSettings()
