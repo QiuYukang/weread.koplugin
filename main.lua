@@ -14,6 +14,8 @@ local time = require("ui/time")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local T = require("ffi/util").template
+local Device = require("device")
+local PluginShare = require("pluginshare")
 
 local Cookie = require("lib.cookie")
 local Client = require("lib.client")
@@ -1177,6 +1179,71 @@ function WeReadPlugin:runOnlineTask(label, callback, delay)
     return true
 end
 
+
+-- Block OS-level standby (Kindle powerd, Kobo lid/menu-suspend, etc.)
+local function preventOsStandby()
+    if Device:isKindle() then
+        os.execute("lipc-set-prop com.lab126.powerd preventScreenSaver 1")
+    end
+    if Device:isCervantes() or Device:isKobo() then
+        PluginShare.pause_auto_suspend = true
+    end
+end
+
+local function allowOsStandby()
+    if Device:isKindle() then
+        os.execute("lipc-set-prop com.lab126.powerd preventScreenSaver 0")
+    end
+    if Device:isCervantes() or Device:isKobo() then
+        PluginShare.pause_auto_suspend = false
+    end
+end
+
+-- Keep the device awake during long book downloads.
+function WeReadPlugin:_beginDownloadStandby()
+    self._download_standby_ref = (self._download_standby_ref or 0) + 1
+    if self._download_standby_ref == 1 then
+        UIManager:preventStandby()
+        preventOsStandby()
+    end
+end
+
+function WeReadPlugin:_endDownloadStandby()
+    local ref = self._download_standby_ref or 0
+    if ref <= 0 then
+        return
+    end
+    self._download_standby_ref = ref - 1
+    if self._download_standby_ref == 0 then
+        UIManager:allowStandby()
+        allowOsStandby()
+    end
+end
+
+function WeReadPlugin:_releaseBookDownloadStandby(dl)
+    if dl and dl.standby_guard then
+        dl.standby_guard = nil
+        self:_endDownloadStandby()
+    end
+end
+
+function WeReadPlugin:_scheduleDownloadStep(dl, delay)
+    UIManager:scheduleIn(delay or 0.1, function()
+        local ok, err = xpcall(function()
+            self:_downloadStep(dl)
+        end, debug.traceback)
+        if not ok and dl.standby_guard then
+            self:_releaseBookDownloadStandby(dl)
+            if dl.progress_dialog then
+                dl.progress_dialog:close()
+                dl.progress_dialog = nil
+            end
+            logger.err(LOG_MODULE, "download step failed:", log_error(err))
+            self:showInfo(T(_("Download failed:\n%1"), display_error(err)))
+        end
+    end)
+end
+
 function WeReadPlugin:runNetworkAction(label, action)
     self:runOnlineTask(label, function()
         local ok, result = pcall(action)
@@ -2193,6 +2260,7 @@ function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix, options)
             return
         end
 
+        self:_beginDownloadStandby()
         local total = #chapters
         local dl = {
             book = book,
@@ -2209,6 +2277,7 @@ function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix, options)
             annotation_failed_batches = 0,
             single_chapter = options.single_chapter == true,
             started_at = time.now(),
+            standby_guard = true,
         }
 
         local progress_dialog = DownloadDialog:new{
@@ -2231,9 +2300,7 @@ function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix, options)
         progress_dialog:show()
         self:refreshUI()
 
-        UIManager:scheduleIn(0.1, function()
-            self:_downloadStep(dl)
-        end)
+        self:_scheduleDownloadStep(dl)
     end)
 end
 
@@ -2265,7 +2332,7 @@ function WeReadPlugin:_failCurrentDownloadChapter(dl, err)
     if dl.progress_dialog then
         dl.progress_dialog:reportProgress(dl.index - 1)
     end
-    UIManager:scheduleIn(0.1, function() self:_downloadStep(dl) end)
+    self:_scheduleDownloadStep(dl)
 end
 
 function WeReadPlugin:_finishCurrentDownloadChapter(dl)
@@ -2303,7 +2370,7 @@ function WeReadPlugin:_finishCurrentDownloadChapter(dl)
     if dl.progress_dialog then
         dl.progress_dialog:reportProgress(dl.index - 1)
     end
-    UIManager:scheduleIn(0.1, function() self:_downloadStep(dl) end)
+    self:_scheduleDownloadStep(dl)
 end
 
 function WeReadPlugin:_applyCurrentAnnotations(dl)
@@ -2336,6 +2403,7 @@ end
 
 function WeReadPlugin:_downloadAnnotationBatch(dl)
     if dl.cancelled then
+        self:_releaseBookDownloadStandby(dl)
         self:showTransientInfo(_("Download cancelled"), 2)
         return
     end
@@ -2427,6 +2495,7 @@ end
 
 function WeReadPlugin:_downloadStep(dl)
     if dl.cancelled then
+        self:_releaseBookDownloadStandby(dl)
         self:showTransientInfo(_("Download cancelled"), 2)
         return
     end
@@ -2437,6 +2506,7 @@ function WeReadPlugin:_downloadStep(dl)
                 dl.progress_dialog:close()
                 dl.progress_dialog = nil
             end
+            self:_releaseBookDownloadStandby(dl)
             logger.err(LOG_MODULE, "book download failed: no chapters downloaded")
             self:showInfo(_("No chapters were downloaded."))
             return
@@ -2467,6 +2537,7 @@ function WeReadPlugin:_downloadStep(dl)
             dl.progress_dialog:close()
             dl.progress_dialog = nil
         end
+        self:_releaseBookDownloadStandby(dl)
         local books = self.settings:get("books", {})
         local book_id = dl.book.book_id or dl.book.bookId
         if book_id then
