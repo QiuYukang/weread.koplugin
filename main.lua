@@ -2798,7 +2798,7 @@ function WeReadPlugin:showEndOfBookDialog(book_id)
             text = _("WeRead: Bookshelf"),
             callback = function()
                 UIManager:close(dialog)
-                UIManager:scheduleIn(0, function()
+                UIManager:scheduleIn(0.1, function()
                     self:showBookshelf()
                 end)
             end
@@ -2807,7 +2807,7 @@ function WeReadPlugin:showEndOfBookDialog(book_id)
             text = _("WeRead: Chapter list"),
             callback = function()
                 UIManager:close(dialog)
-                UIManager:scheduleIn(0, function()
+                UIManager:scheduleIn(0.1, function()
                     self:showChapterList(book)
                 end)
             end
@@ -2822,7 +2822,7 @@ function WeReadPlugin:showEndOfBookDialog(book_id)
                 text = _("WeRead: Next chapter"),
                 callback = function()
                     UIManager:close(dialog)
-                    UIManager:scheduleIn(0, function()
+                    UIManager:scheduleIn(0.1, function()
                         local cached = book.cached_chapters and book.cached_chapters[tostring(next_chapter.chapterUid)]
                         if cached then
                             self:openFile(cached)
