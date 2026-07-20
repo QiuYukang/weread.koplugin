@@ -380,6 +380,14 @@ function ReadReport:ensure_context(book_id, force)
     book.book_id = book.book_id or book.bookId or book_id
     book.reader_url = WeRead.reader_url(book_id)
 
+    -- BookStore never persists the chapter list, so a freshly loaded record
+    -- has no chapters. Restore them from the on-disk catalog cache first;
+    -- otherwise the TTL check below can never pass and every report would
+    -- refetch the whole reader page.
+    if type(book.chapters) ~= "table" or #book.chapters == 0 then
+        Content.load_catalog_cache(self.client, self.settings, book)
+    end
+
     local age = self.now() - (tonumber(book.read_context_updated_at) or 0)
     local ready = tostring(book.psvts or "") ~= ""
         and book.chapter_uid ~= nil
@@ -389,9 +397,6 @@ function ReadReport:ensure_context(book_id, force)
     end
 
     Content.ensure_reader_state(self.client, book)
-    if not force and (type(book.chapters) ~= "table" or #book.chapters == 0) then
-        Content.load_catalog_cache(self.client, self.settings, book)
-    end
     if force or type(book.chapters) ~= "table" or #book.chapters == 0 then
         local chapters = Content.fetch_catalog(self.client, book)
         local cache_ok, cache_err = Content.save_catalog_cache(
