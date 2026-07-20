@@ -6,11 +6,29 @@ if not ok_logger then
     logger = nil
 end
 
+local ok_ffiutil, ffiutil = pcall(require, "ffi/util")
+if not ok_ffiutil then
+    ffiutil = nil
+end
+
 local LOG_MODULE = "[WeRead][ReadReport]"
 local DEFAULT_INTERVAL_SECONDS = 30
 local MIN_INTERVAL_SECONDS = 10
 local CONTEXT_TTL_SECONDS = 15 * 60
 local RENEWAL_COOLDOWN_SECONDS = 10 * 60
+local JOB_POLL_INITIAL_SECONDS = 0.25
+local JOB_POLL_MAX_SECONDS = 2
+local JOB_TIMEOUT_SECONDS = 180
+local JOB_COLLECT_INTERVAL_SECONDS = 2
+
+-- Context fields that the subprocess sends back for the parent to persist.
+-- Mirrors the scalar reading-state fields stored by BookStore; the chapter
+-- catalog itself stays in the on-disk catalog cache written by the child.
+local CONTEXT_FIELDS = {
+    "title", "reader_url", "app_id", "psvts", "pclts", "token",
+    "chapter_uid", "chapter_idx", "chapter_offset", "progress", "summary",
+    "read_context_updated_at",
+}
 
 local ReadReport = {}
 ReadReport.__index = ReadReport
@@ -19,6 +37,37 @@ local function log(level, ...)
     if logger and type(logger[level]) == "function" then
         logger[level](LOG_MODULE, ...)
     end
+end
+
+local function make_subprocess_runner()
+    if not ffiutil or type(ffiutil.runInSubProcess) ~= "function" then
+        return nil
+    end
+    return {
+        -- Returns pid, parent_read_fd on success; false, error message on failure.
+        run = function(child_func)
+            return ffiutil.runInSubProcess(child_func, true)
+        end,
+        -- Blocking write from inside the child; closes the fd when done.
+        write_all = function(fd, data)
+            return ffiutil.writeToFD(fd, data, true)
+        end,
+        -- Non-blocking waitpid; also reaps the child once it has exited.
+        is_done = function(pid)
+            return ffiutil.isSubProcessDone(pid)
+        end,
+        terminate = function(pid)
+            ffiutil.terminateSubProcess(pid)
+        end,
+        -- Non-blocking readable-size probe (0 when nothing is buffered).
+        read_size = function(fd)
+            return ffiutil.getNonBlockingReadSize(fd)
+        end,
+        -- Reads until EOF and closes the fd.
+        read_all = function(fd)
+            return ffiutil.readAllFromFD(fd)
+        end,
+    }
 end
 
 local function book_record(books, book_id)
@@ -134,6 +183,7 @@ function ReadReport:new(options)
         detect_book = options.detect_book,
         is_online = options.is_online or function() return true end,
         now = options.now or os.time,
+        subprocess = options.subprocess or make_subprocess_runner(),
         state = "stopped",
         generation = 0,
         count = 0,
@@ -281,15 +331,7 @@ function ReadReport:start(reason)
         if self.generation ~= generation or self.task ~= task then
             return
         end
-        local ok, err = pcall(function()
-            self:report_once()
-        end)
-        if not ok then
-            self:_set_error(err, "task", "read report task failed:")
-        end
-        if self.generation == generation and self.task == task then
-            self.scheduler:scheduleIn(self:_interval(), task)
-        end
+        self:_tick(generation, task)
     end
     self.task = task
     self.scheduler:scheduleIn(self:_interval(), task)
@@ -307,6 +349,9 @@ function ReadReport:stop(reason)
     if self.task then
         self.scheduler:unschedule(self.task)
         self.task = nil
+    end
+    if self.job then
+        self:_abandon_job(self.job)
     end
     self.state = reason == "suspend" and "suspended"
         or "stopped"
@@ -346,6 +391,466 @@ function ReadReport:on_close_document()
     self:maybe_start("document_closed_background")
 end
 
+-- ------------------------------------------------------------------
+-- Scheduled tick: cheap parent-side checks, then hand the network
+-- pipeline to a subprocess (or run it inline as a fallback).
+-- ------------------------------------------------------------------
+
+function ReadReport:_schedule_next(generation, task)
+    if self.generation == generation and self.task == task then
+        self.scheduler:scheduleIn(self:_interval(), task)
+    end
+end
+
+function ReadReport:_tick(generation, task)
+    local ok, err = pcall(function()
+        local proceed, book_id = self:_precheck()
+        if not proceed then
+            self:_schedule_next(generation, task)
+            return
+        end
+        if self.job then
+            -- Previous report is still in flight; keep the cadence and let
+            -- the poller reschedule once it completes.
+            self:_schedule_next(generation, task)
+            return
+        end
+        local allow_renewal = self:_renewal_allowed()
+        local spawned, spawn_err = self:_start_job(book_id, allow_renewal, generation, task)
+        if spawned then
+            return
+        end
+        if not self.logged_inline_fallback then
+            log("warn", "read report subprocess unavailable, reporting inline:",
+                tostring(spawn_err))
+            self.logged_inline_fallback = true
+        end
+        local outcome = self:_run_pipeline(book_id, { allow_renewal = allow_renewal })
+        self:_apply_outcome(outcome)
+        self:_schedule_next(generation, task)
+    end)
+    if not ok then
+        self:_set_error(err, "task", "read report task failed:")
+        self:_schedule_next(generation, task)
+    end
+end
+
+-- Parent-side gate before any network work. Returns true, book_id when a
+-- report should be attempted. Must stay cheap: it runs on the UI loop.
+function ReadReport:_precheck()
+    local config = self:_config()
+    if not config.enabled then
+        self:stop("disabled")
+        return false
+    end
+    if self.suspended then
+        self:stop("suspend")
+        return false
+    end
+
+    local book_id, title, source = self:resolve_target()
+    if not book_id then
+        self:stop(source)
+        return false
+    end
+    if self.current_book_id and self.current_book_id ~= book_id then
+        self:stop("document_changed")
+        self:maybe_start("document_changed")
+        return false
+    end
+    self.current_book_id = book_id
+    self.current_book_title = title
+    self.current_book_source = source
+
+    if not self.settings:is_cookie_configured() then
+        self:_set_error("cookie not configured", "authentication", "read report skipped:")
+        return false
+    end
+    if not self.is_online() then
+        self.state = "offline"
+        self:_log_skip("offline")
+        return false
+    end
+    return true, book_id
+end
+
+function ReadReport:_renewal_allowed()
+    return self.now() - (self.last_renew_attempt or 0) >= RENEWAL_COOLDOWN_SECONDS
+end
+
+-- ------------------------------------------------------------------
+-- Subprocess job management (parent side)
+-- ------------------------------------------------------------------
+
+function ReadReport:_start_job(book_id, allow_renewal, generation, task)
+    local runner = self.subprocess
+    if not runner then
+        return false, "no subprocess support"
+    end
+    local pid, read_fd = runner.run(function(_pid, child_write_fd)
+        local outcome = self:_child_report(book_id, allow_renewal)
+        local ok, encoded = pcall(function()
+            return self.client:json_encode(outcome)
+        end)
+        if not ok or type(encoded) ~= "string" then
+            encoded = '{"accepted":false,"error":"failed to serialize report outcome",'
+                .. '"error_kind":"job"}'
+        end
+        runner.write_all(child_write_fd, encoded)
+    end)
+    if not pid then
+        return false, tostring(read_fd)
+    end
+
+    local job = {
+        pid = pid,
+        read_fd = read_fd,
+        book_id = book_id,
+        started_at = self.now(),
+        poll_interval = JOB_POLL_INITIAL_SECONDS,
+    }
+    job.poll = function()
+        self:_poll_job(job, generation, task)
+    end
+    self.job = job
+    self.scheduler:scheduleIn(job.poll_interval, job.poll)
+    return true
+end
+
+function ReadReport:_poll_job(job, generation, task)
+    if self.job ~= job then
+        return
+    end
+    local runner = self.subprocess
+    local done = runner.is_done(job.pid)
+    local readable = job.read_fd and runner.read_size(job.read_fd)
+    if done or (readable and readable > 0) then
+        local payload
+        if job.read_fd then
+            payload = runner.read_all(job.read_fd)
+            job.read_fd = nil
+        end
+        self.job = nil
+        if not done then
+            -- Output was read while the child was still exiting; reap it in
+            -- the background so it does not linger as a zombie.
+            self:_collect_pid(job.pid)
+        end
+        self:_apply_job_outcome(job.book_id, self:_decode_outcome(payload))
+        self:_schedule_next(generation, task)
+        return
+    end
+    if self.now() - job.started_at > JOB_TIMEOUT_SECONDS then
+        log("warn", "read report job timed out, terminating:", "pid=", job.pid)
+        self:_abandon_job(job)
+        self:_set_error("report job timed out", "transport", "read report job failed:")
+        self:_schedule_next(generation, task)
+        return
+    end
+    job.poll_interval = math.min(job.poll_interval * 2, JOB_POLL_MAX_SECONDS)
+    self.scheduler:scheduleIn(job.poll_interval, job.poll)
+end
+
+-- Kill a running job and keep reaping until the child is collected, so a
+-- stopped or timed-out report can never leave a zombie behind.
+function ReadReport:_abandon_job(job)
+    job = job or self.job
+    if not job then
+        return
+    end
+    if self.job == job then
+        self.job = nil
+    end
+    local runner = self.subprocess
+    if job.poll then
+        self.scheduler:unschedule(job.poll)
+    end
+    runner.terminate(job.pid)
+    local collect
+    collect = function()
+        if runner.is_done(job.pid) then
+            if job.read_fd then
+                runner.read_all(job.read_fd)
+                job.read_fd = nil
+            end
+            return
+        end
+        if job.read_fd and (runner.read_size(job.read_fd) or 0) ~= 0 then
+            -- Drain the pipe so a child blocked on write() can exit.
+            runner.read_all(job.read_fd)
+            job.read_fd = nil
+        end
+        self.scheduler:scheduleIn(JOB_COLLECT_INTERVAL_SECONDS, collect)
+    end
+    collect()
+end
+
+function ReadReport:_collect_pid(pid)
+    local runner = self.subprocess
+    local collect
+    collect = function()
+        if not runner.is_done(pid) then
+            self.scheduler:scheduleIn(JOB_COLLECT_INTERVAL_SECONDS, collect)
+        end
+    end
+    self.scheduler:scheduleIn(1, collect)
+end
+
+function ReadReport:_decode_outcome(payload)
+    if type(payload) ~= "string" or payload == "" then
+        return nil
+    end
+    local ok, decoded = pcall(function()
+        return self.client:json_decode(payload)
+    end)
+    if ok and type(decoded) == "table" then
+        return decoded
+    end
+    return nil
+end
+
+-- ------------------------------------------------------------------
+-- Outcome application (parent side)
+-- ------------------------------------------------------------------
+
+function ReadReport:_apply_job_outcome(book_id, outcome)
+    if type(outcome) == "table" then
+        if type(outcome.auth) == "table" then
+            local ok, err = pcall(function()
+                self.settings:update_auth({
+                    cookies = outcome.auth.cookies,
+                    wr_ticket = outcome.auth.wr_ticket,
+                    wr_wrpa = outcome.auth.wr_wrpa,
+                }, { replace_cookies = true })
+            end)
+            if not ok then
+                log("warn", "persist renewed auth failed:", tostring(err))
+            end
+        end
+        if type(outcome.book) == "table" then
+            local ok, err = pcall(function()
+                self:_persist_context(book_id, outcome.book)
+            end)
+            if not ok then
+                log("warn", "persist report context failed:", tostring(err))
+            end
+        end
+    end
+    return self:_apply_outcome(outcome)
+end
+
+function ReadReport:_apply_outcome(outcome)
+    if type(outcome) ~= "table" then
+        self:_set_error("report job returned no result", "job", "read report job failed:")
+        return false
+    end
+    if outcome.renew_attempted then
+        self.last_renew_attempt = self.now()
+    end
+    if outcome.accepted then
+        self:_record_success({ synckey = outcome.has_synckey and true or nil })
+        return true
+    end
+    self:_set_error(outcome.error or "unknown report failure",
+        outcome.error_kind or "error",
+        outcome.error_prefix)
+    return false
+end
+
+function ReadReport:_context_snapshot(book)
+    local snapshot = { book_id = book.book_id }
+    for _i, field in ipairs(CONTEXT_FIELDS) do
+        snapshot[field] = book[field]
+    end
+    return snapshot
+end
+
+function ReadReport:_persist_context(book_id, snapshot)
+    local books = self.settings:get("books", {})
+    local book = book_record(books, book_id) or { book_id = book_id }
+    local changed = false
+    -- Replace semantics, not merge: a refreshed context may legitimately
+    -- clear session fields (notably pclts), and the old wholesale record
+    -- overwrite dropped them too. JSON strips nils from the outcome, so a
+    -- missing snapshot field means "cleared".
+    for _i, field in ipairs(CONTEXT_FIELDS) do
+        local value = snapshot[field]
+        if book[field] ~= value then
+            book[field] = value
+            changed = true
+        end
+    end
+    if not changed then
+        return
+    end
+    book.book_id = book.book_id or book_id
+    books[book_id] = book
+    self.settings:set("books", books)
+    self.settings:flush()
+end
+
+-- ------------------------------------------------------------------
+-- Report pipeline (runs in the subprocess, or inline as fallback)
+-- ------------------------------------------------------------------
+
+-- Child entry point. Neuters settings persistence inside the fork and
+-- captures auth changes (Set-Cookie merges, cookie renewal) so the parent
+-- can persist them from the outcome.
+function ReadReport:_child_report(book_id, allow_renewal)
+    self._no_persist = true
+    self.settings.flush = function() end
+    local auth_changed = false
+    local original_update_auth = self.settings.update_auth
+    self.settings.update_auth = function(settings_obj, credentials, options)
+        auth_changed = true
+        options = options or {}
+        options.flush = false
+        return original_update_auth(settings_obj, credentials, options)
+    end
+
+    local ok, outcome = pcall(function()
+        return self:_run_pipeline(book_id, { allow_renewal = allow_renewal })
+    end)
+    if not ok then
+        outcome = {
+            accepted = false,
+            error = tostring(outcome),
+            error_kind = "task",
+            error_prefix = "read report task failed:",
+        }
+    end
+    if auth_changed then
+        outcome.auth = {
+            cookies = self.settings:get("cookies", {}),
+            wr_ticket = self.settings:get("wr_ticket", ""),
+            wr_wrpa = self.settings:get("wr_wrpa", ""),
+        }
+    end
+    return outcome
+end
+
+-- Full report attempt: context, send, refresh-retry, renewal, final retry.
+-- Pure with respect to the parent state machine: everything the caller needs
+-- is described by the returned outcome table.
+function ReadReport:_run_pipeline(book_id, opts)
+    opts = opts or {}
+    local outcome = { accepted = false, renew_attempted = false }
+
+    local context_ok, book = pcall(function()
+        return self:ensure_context(book_id, false)
+    end)
+    if not context_ok then
+        outcome.error = tostring(book)
+        outcome.error_kind = "context"
+        outcome.error_prefix = "read report context initialization failed:"
+        return outcome
+    end
+    outcome.book = self:_context_snapshot(book)
+
+    local ok, result, http_code = pcall(function()
+        return self:_send(book_id, book)
+    end)
+    local accepted, accepted_body = response_accepted(result, http_code)
+    if ok and accepted then
+        outcome.accepted = true
+        outcome.has_synckey = type(accepted_body) == "table"
+            and accepted_body.synckey ~= nil or false
+        return outcome
+    end
+    if not ok then
+        outcome.error = tostring(result)
+        outcome.error_kind = "transport"
+        outcome.error_prefix = "read report request failed:"
+        return outcome
+    end
+
+    local failure = response_summary(self.client, result, http_code)
+    local refresh_ok, refreshed = pcall(function()
+        return self:ensure_context(book_id, true)
+    end)
+    if refresh_ok then
+        outcome.book = self:_context_snapshot(refreshed)
+        local retry_ok, retry_result, retry_code = pcall(function()
+            return self:_send(book_id, refreshed)
+        end)
+        local retry_accepted, retry_body = response_accepted(retry_result, retry_code)
+        if retry_ok and retry_accepted then
+            outcome.accepted = true
+            outcome.has_synckey = type(retry_body) == "table"
+                and retry_body.synckey ~= nil or false
+            return outcome
+        end
+        failure = "initial=" .. failure .. "; refreshed="
+            .. (retry_ok and response_summary(self.client, retry_result, retry_code)
+                or tostring(retry_result))
+    else
+        failure = failure .. "; context_refresh=" .. tostring(refreshed)
+    end
+
+    if not opts.allow_renewal then
+        outcome.error = failure
+        outcome.error_kind = "server"
+        outcome.error_prefix = "read report server rejected:"
+        return outcome
+    end
+    outcome.renew_attempted = true
+
+    local renew_ok, renew_result = pcall(function()
+        return self.client:renew_cookie()
+    end)
+    if not renew_ok or not WeRead.is_success_response(renew_result) then
+        outcome.error = failure .. "; renewal=" .. (renew_ok
+            and response_summary(self.client, renew_result)
+            or tostring(renew_result))
+        outcome.error_kind = "authentication"
+        outcome.error_prefix = "read report cookie renewal failed:"
+        return outcome
+    end
+
+    local final_context_ok, final_book = pcall(function()
+        return self:ensure_context(book_id, true)
+    end)
+    if not final_context_ok then
+        outcome.error = failure .. "; final_context=" .. tostring(final_book)
+        outcome.error_kind = "context"
+        outcome.error_prefix = "read report final context refresh failed:"
+        return outcome
+    end
+    outcome.book = self:_context_snapshot(final_book)
+    local final_ok, final_result, final_code = pcall(function()
+        return self:_send(book_id, final_book)
+    end)
+    local final_accepted, final_body = response_accepted(final_result, final_code)
+    if final_ok and final_accepted then
+        outcome.accepted = true
+        outcome.has_synckey = type(final_body) == "table"
+            and final_body.synckey ~= nil or false
+        return outcome
+    end
+    outcome.error = failure .. "; final=" .. (final_ok
+        and response_summary(self.client, final_result, final_code)
+        or tostring(final_result))
+    outcome.error_kind = final_ok and "server" or "transport"
+    outcome.error_prefix = "read report final retry failed:"
+    return outcome
+end
+
+-- Inline (blocking) report used when subprocess support is unavailable.
+function ReadReport:report_once()
+    local proceed, book_id = self:_precheck()
+    if not proceed then
+        return false
+    end
+    local outcome = self:_run_pipeline(book_id, {
+        allow_renewal = self:_renewal_allowed(),
+    })
+    return self:_apply_outcome(outcome)
+end
+
+-- ------------------------------------------------------------------
+-- Report context
+-- ------------------------------------------------------------------
+
 function ReadReport:_merge_remote_progress(book_id, book)
     local ok, result = pcall(function()
         return self.client:get_progress(book_id)
@@ -363,20 +868,9 @@ function ReadReport:_merge_remote_progress(book_id, book)
     book.summary = remote.summary or book.summary or ""
 end
 
-function ReadReport:ensure_context(book_id, force)
-    book_id = tostring(book_id or "")
-    if book_id == "" then
-        error("missing book id")
-    end
-    if not self.settings:is_cookie_configured() then
-        error("cookie not configured")
-    end
-
-    local books = self.settings:get("books", {})
-    local book = book_record(books, book_id) or {
-        book_id = book_id,
-        title = self.current_book_title or book_id,
-    }
+-- Build (and refresh when stale) the reader context on the given book
+-- record. Performs network I/O; never persists settings.
+function ReadReport:_build_context(book_id, force, book)
     book.book_id = book.book_id or book.bookId or book_id
     book.reader_url = WeRead.reader_url(book_id)
 
@@ -425,7 +919,28 @@ function ReadReport:ensure_context(book_id, force)
     if tostring(book.psvts or "") == "" or book.chapter_uid == nil then
         error("reader context is incomplete")
     end
+    return book
+end
 
+function ReadReport:ensure_context(book_id, force)
+    book_id = tostring(book_id or "")
+    if book_id == "" then
+        error("missing book id")
+    end
+    if not self.settings:is_cookie_configured() then
+        error("cookie not configured")
+    end
+
+    local books = self.settings:get("books", {})
+    local book = book_record(books, book_id) or {
+        book_id = book_id,
+        title = self.current_book_title or book_id,
+    }
+    self:_build_context(book_id, force, book)
+    if self._no_persist then
+        -- Forked child: the parent persists the context from the outcome.
+        return book
+    end
     books[book_id] = book
     self.settings:set("books", books)
     self.settings:flush()
@@ -452,129 +967,6 @@ end
 function ReadReport:_send(book_id, book)
     local payload = self:build_payload(book_id, self:_interval(), book)
     return self.client:report_read(payload, book.reader_url or WeRead.reader_url(book_id))
-end
-
-function ReadReport:report_once()
-    local config = self:_config()
-    if not config.enabled then
-        self:stop("disabled")
-        return false
-    end
-    if self.suspended then
-        self:stop("suspend")
-        return false
-    end
-
-    local book_id, title, source = self:resolve_target()
-    if not book_id then
-        self:stop(source)
-        return false
-    end
-    if self.current_book_id and self.current_book_id ~= book_id then
-        self:stop("document_changed")
-        self:maybe_start("document_changed")
-        return false
-    end
-    self.current_book_id = book_id
-    self.current_book_title = title
-    self.current_book_source = source
-
-    if not self.settings:is_cookie_configured() then
-        self:_set_error("cookie not configured", "authentication", "read report skipped:")
-        return false
-    end
-    if not self.is_online() then
-        self.state = "offline"
-        self:_log_skip("offline")
-        return false
-    end
-
-    local context_ok, book = pcall(function()
-        return self:ensure_context(book_id, false)
-    end)
-    if not context_ok then
-        self:_set_error(book, "context", "read report context initialization failed:")
-        return false
-    end
-
-    local ok, result, http_code = pcall(function()
-        return self:_send(book_id, book)
-    end)
-    local accepted, accepted_body = response_accepted(result, http_code)
-    if ok and accepted then
-        self:_record_success(accepted_body)
-        return true
-    end
-    if not ok then
-        self:_set_error(result, "transport", "read report request failed:")
-        return false
-    end
-
-    local failure = response_summary(self.client, result, http_code)
-    local refresh_ok, refreshed = pcall(function()
-        return self:ensure_context(book_id, true)
-    end)
-    if refresh_ok then
-        local retry_ok, retry_result, retry_code = pcall(function()
-            return self:_send(book_id, refreshed)
-        end)
-        local retry_accepted, retry_body = response_accepted(retry_result, retry_code)
-        if retry_ok and retry_accepted then
-            self:_record_success(retry_body)
-            return true
-        end
-        failure = "initial=" .. failure .. "; refreshed="
-            .. (retry_ok and response_summary(self.client, retry_result, retry_code)
-                or tostring(retry_result))
-    else
-        failure = failure .. "; context_refresh=" .. tostring(refreshed)
-    end
-
-    local now = self.now()
-    if now - (self.last_renew_attempt or 0) < RENEWAL_COOLDOWN_SECONDS then
-        self:_set_error(failure, "server", "read report server rejected:")
-        return false
-    end
-    self.last_renew_attempt = now
-
-    local renew_ok, renew_result = pcall(function()
-        return self.client:renew_cookie()
-    end)
-    if not renew_ok or not WeRead.is_success_response(renew_result) then
-        self:_set_error(
-            failure .. "; renewal=" .. (renew_ok
-                and response_summary(self.client, renew_result)
-                or tostring(renew_result)),
-            "authentication",
-            "read report cookie renewal failed:"
-        )
-        return false
-    end
-
-    local final_context_ok, final_book = pcall(function()
-        return self:ensure_context(book_id, true)
-    end)
-    if not final_context_ok then
-        self:_set_error(failure .. "; final_context=" .. tostring(final_book),
-            "context", "read report final context refresh failed:")
-        return false
-    end
-    local final_ok, final_result, final_code = pcall(function()
-        return self:_send(book_id, final_book)
-    end)
-    local final_accepted, final_body = response_accepted(final_result, final_code)
-    if final_ok and final_accepted then
-        self:_record_success(final_body)
-        return true
-    end
-    self:_set_error(
-        failure .. "; final=" .. (final_ok
-            and response_summary(self.client, final_result, final_code)
-            or tostring(final_result)),
-        final_ok and "server" or "transport",
-        "read report final retry failed:"
-    )
-    return false
 end
 
 return ReadReport
