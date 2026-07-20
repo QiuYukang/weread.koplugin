@@ -136,6 +136,26 @@ local function write_file(path, data)
     return true
 end
 
+--- Compute a fingerprint of download-affecting settings so cached chapters
+--- are invalidated when the user changes relevant options.
+local function compute_settings_fingerprint(settings)
+    local cache = settings:get("cache", {})
+    -- Settings that affect chapter content; changing any of these requires
+    -- re-downloading all chapters.
+    return string.format("th=%s_img=%s",
+        tostring(cache.download_underlines_and_thoughts == true),
+        tostring(cache.download_book_images == true))
+end
+
+--- Remove all cached chapter data for a book.
+local function clear_chapter_cache(settings, book)
+    local root = chapter_cache_root(settings, book)
+    if root and root ~= "" and root ~= "/" then
+        os.execute("rm -rf " .. string.format("%q", root))
+        logger.info(LOG_MODULE, "chapter cache cleared (settings changed):", root)
+    end
+end
+
 --- Persist dl.state fields that accumulate across chapters so cached
 --- chapters can reconstruct the annotation CSS state.
 local function save_book_state(settings, book, state)
@@ -145,6 +165,7 @@ local function save_book_state(settings, book, state)
     local payload = {
         css = state.css or "",
         annotation_css_seen = state.annotation_css_seen or {},
+        settings_fingerprint = compute_settings_fingerprint(settings),
     }
     local ok, encoded = pcall(function() return json.encode(payload) end)
     if ok then
@@ -153,18 +174,27 @@ local function save_book_state(settings, book, state)
 end
 
 --- Load previously persisted dl.state fields (annotation CSS accumulator).
+-- Returns nil if the saved fingerprint does not match current settings
+-- (stale cache after user changed download options).
 local function load_book_state(settings, book)
     if not json then return nil end
     local raw = read_file(book_state_path(settings, book))
     if not raw then return nil end
     local ok, payload = pcall(function() return json.decode(raw) end)
-    if ok and type(payload) == "table" then
-        return {
-            css = payload.css or "",
-            annotation_css_seen = payload.annotation_css_seen or {},
-        }
+    if not ok or type(payload) ~= "table" then
+        return nil
     end
-    return nil
+    local current_fp = compute_settings_fingerprint(settings)
+    if payload.settings_fingerprint and payload.settings_fingerprint ~= current_fp then
+        logger.info(LOG_MODULE, "chapter cache settings fingerprint mismatch, discarding:",
+            "saved=", payload.settings_fingerprint, "current=", current_fp)
+        clear_chapter_cache(settings, book)
+        return nil
+    end
+    return {
+        css = payload.css or "",
+        annotation_css_seen = payload.annotation_css_seen or {},
+    }
 end
 
 --- Persist a fully-processed chapter so subsequent downloads can skip it.
