@@ -237,6 +237,12 @@ function ReadReport:resolve_target()
     local detected_id = self.detect_book()
     if detected_id then
         detected_id = tostring(detected_id)
+        -- Avoid reloading every book record from disk on each tick just for
+        -- the title; reuse the cached one while the target stays the same.
+        if detected_id == self.current_book_id
+            and tostring(self.current_book_title or "") ~= "" then
+            return detected_id, self.current_book_title, "current_document"
+        end
         local book = book_record(self.settings:get("books", {}), detected_id)
         return detected_id,
             type(book) == "table" and book.title or detected_id,
