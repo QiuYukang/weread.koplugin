@@ -24,6 +24,21 @@ local function getSQ3()
     return nil
 end
 
+--- Delete thoughts.db and WAL/SHM sidecars. Missing files are ignored.
+function ThoughtDB.remove_db(book_dir)
+    if type(book_dir) ~= "string" or book_dir == "" then
+        return false
+    end
+    for _, path in ipairs({
+        book_dir .. "/thoughts.db",
+        book_dir .. "/thoughts.db-wal",
+        book_dir .. "/thoughts.db-shm",
+    }) do
+        os.remove(path)
+    end
+    return true
+end
+
 --- Open or create the per-book thought database.
 function ThoughtDB.open(book_dir)
     if type(book_dir) ~= "string" or book_dir == "" then
@@ -36,7 +51,6 @@ function ThoughtDB.open(book_dir)
         return nil
     end
 
-    
     local lfs = require("libs/libkoreader-lfs")
     lfs.mkdir(book_dir)
     local db_path = book_dir .. "/thoughts.db"
@@ -50,22 +64,28 @@ function ThoughtDB.open(book_dir)
     pcall(function() db:exec("PRAGMA journal_mode=WAL") end)
     pcall(function() db:exec("PRAGMA synchronous=NORMAL") end)
 
-    db:exec([[
-        CREATE TABLE IF NOT EXISTS reviews (
-            chapter_uid INTEGER NOT NULL,
-            range       TEXT    NOT NULL,
-            review_json TEXT    NOT NULL,
-            review_html TEXT    NOT NULL,
-            item_count  INTEGER NOT NULL DEFAULT 0,
-            updated_at  INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (chapter_uid, range)
-        )
-    ]])
-
-    db:exec([[
-        CREATE INDEX IF NOT EXISTS idx_reviews_lookup
-        ON reviews(chapter_uid, range)
-    ]])
+    local schema_ok, schema_err = pcall(function()
+        db:exec([[
+            CREATE TABLE IF NOT EXISTS reviews (
+                chapter_uid INTEGER NOT NULL,
+                range       TEXT    NOT NULL,
+                review_json TEXT    NOT NULL,
+                review_html TEXT    NOT NULL,
+                item_count  INTEGER NOT NULL DEFAULT 0,
+                updated_at  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chapter_uid, range)
+            )
+        ]])
+        db:exec([[
+            CREATE INDEX IF NOT EXISTS idx_reviews_lookup
+            ON reviews(chapter_uid, range)
+        ]])
+    end)
+    if not schema_ok then
+        logger.warn("weread: thought_db schema init failed:", db_path, schema_err)
+        pcall(function() db:close() end)
+        return nil
+    end
 
     logger.info("weread: thought_db opened", db_path)
     return db
@@ -85,8 +105,10 @@ function ThoughtDB.getReviewHTML(db, chapter_uid, range_str)
     end)
     if not ok or not stmt then return nil end
 
-    local row = stmt:reset():bind(chapter_uid, range_str):step()
-    if row then
+    local step_ok, row = pcall(function()
+        return stmt:reset():bind(chapter_uid, range_str):step()
+    end)
+    if step_ok and row then
         return row[1], row[2]
     end
     return nil

@@ -97,7 +97,7 @@ function Thoughts.fetch_underlines(client, settings, book_id, chapter_uid)
     return true, data, Thoughts.collect_ranges(data)
 end
 
-function Thoughts.apply_data(settings, book_id, chapter_uid, xhtml, underlines_data, reviews, book)
+function Thoughts.apply_data(settings, book_id, chapter_uid, xhtml, underlines_data, reviews, book, opts)
     if type(underlines_data) ~= "table" then
         underlines_data = {}
     end
@@ -105,7 +105,14 @@ function Thoughts.apply_data(settings, book_id, chapter_uid, xhtml, underlines_d
         local Content = require("lib.content")
         local book_dir = Content.book_resolved_dir(settings, book_id, book)
         local ThoughtDB = require("lib.thought_db")
+        if opts and opts.rebuild_thought_db then
+            ThoughtDB.remove_db(book_dir)
+        end
         local db = ThoughtDB.open(book_dir)
+        if not db then
+            ThoughtDB.remove_db(book_dir)
+            db = ThoughtDB.open(book_dir)
+        end
         if db then
             pcall(ThoughtDB.putReviews, db, chapter_uid, reviews)
             ThoughtDB.close(db)

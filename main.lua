@@ -2799,7 +2799,7 @@ function WeReadPlugin:_buildThoughtHtmlFromHref(href)
     -- 2. JSON fallback for legacy caches
     local reviews = self:_loadThoughtReviews(info.book_id, info.chapter_uid)
     if type(reviews) ~= "table" then
-        self:showInfo(_("No cached thoughts found for this chapter. Please re-download the book with underlines and thoughts."))
+        self:showInfo(_("Thought cache error. Please re-download this book with underlines and thoughts."))
         return nil
     end
     for _i, rv in ipairs(reviews) do

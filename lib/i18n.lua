@@ -20,6 +20,7 @@ local zh = {
     ["Downloading public account article images may significantly increase download time. Continue?"] = "下载公众号文章图片可能会显著延长下载时间，是否继续？",
     ["Downloading underlines and thoughts adds requests for every chapter and may significantly increase download time and cache usage. Continue?"] = "下载划线和想法会为每个章节增加额外请求，并可能显著延长下载时间和增加缓存占用。是否继续？",
     ["No cached thoughts found for this chapter. Please re-download the book with underlines and thoughts."] = "未找到本章的想法缓存，请重新下载本书（含划线和想法）。",
+    ["Thought cache error. Please re-download this book with underlines and thoughts."] = "想法缓存异常，请重新下载本书的划线和想法",
     ["Loading thoughts…"] = "正在加载想法…",
     ["No matching thought found for this underline."] = "未找到该划线对应的想法。",
     ["Confirm"] = "确认",
