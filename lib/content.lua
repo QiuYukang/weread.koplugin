@@ -2,6 +2,7 @@ local Crypto = require("lib.crypto")
 local ReaderState = require("lib.reader_state")
 local WeRead = require("lib.weread")
 local Thoughts = require("lib.thoughts")
+local Footnotes = require("lib.footnotes")
 local bit = require("bit")
 local ok_logger, logger = pcall(require, "logger")
 if not ok_logger then
@@ -994,6 +995,34 @@ function Content.fetch_chapter_css(client, settings, book, chapter)
 end
 
 
+local function append_before_body_close(xhtml, fragment)
+    if type(fragment) ~= "string" or fragment == "" then
+        return xhtml
+    end
+    local pos = xhtml:lower():find("</body>", 1, true)
+    if pos then
+        return xhtml:sub(1, pos - 1) .. fragment .. xhtml:sub(pos)
+    end
+    return xhtml .. fragment
+end
+
+local function footnote_meta(client, settings, book, state)
+    state = state or {}
+    local book_id = book.book_id or book.bookId
+    return {
+        book_dir = Content.book_cache_dir(settings, book_id),
+        book_id = book_id,
+        is_txt = book._content_format == "txt",
+        chapters = state.chapters,
+        fetch_chapter_html = function(chapter)
+            return Content.fetch_chapter_xhtml(client, settings, book, chapter)
+        end,
+        fetch_catalog = function()
+            return Content.fetch_catalog(client, book)
+        end,
+    }
+end
+
 local function apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
     local cache = settings:get("cache", {})
     if cache.download_underlines_and_thoughts ~= true then
@@ -1005,11 +1034,32 @@ local function apply_chapter_annotations(client, settings, book, chapter, xhtml,
     return processed, Thoughts.merge_css(css, annotation_css)
 end
 
+local function apply_chapter_footnotes(client, settings, book, chapter, xhtml, css, state)
+    if book._content_format == "txt" then
+        return xhtml, css
+    end
+    local processed, section = Footnotes.process(xhtml, footnote_meta(client, settings, book, state))
+    if section and section ~= "" then
+        processed = append_before_body_close(processed, section)
+    end
+    if processed ~= xhtml or (section and section ~= "") then
+        css = Thoughts.merge_css(css, Footnotes.FOOTNOTES_CSS)
+    end
+    return processed, css
+end
+
+local function apply_chapter_enrichments(client, settings, book, chapter, xhtml, css, state)
+    xhtml = Footnotes.normalize_markup(xhtml)
+    xhtml, css = apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
+    xhtml, css = apply_chapter_footnotes(client, settings, book, chapter, xhtml, css, state)
+    return xhtml, css
+end
+
 function Content.fetch_chapter_epub(client, settings, book, chapter)
     local book_id = book.book_id or book.bookId
     local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
     local css = Content.fetch_chapter_css(client, settings, book, chapter)
-    xhtml, css = apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
+    xhtml, css = apply_chapter_enrichments(client, settings, book, chapter, xhtml, css, { chapters = book.chapters })
     local assets = {}
     local cache = settings:get("cache", {})
     if cache.download_book_images then
@@ -1033,31 +1083,6 @@ function Content.fetch_chapter_epub(client, settings, book, chapter)
     return path, chapter
 end
 
-function Content.fetch_single_chapter_content(client, settings, book, chapter, state)
-    state = state or {}
-    local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
-    if not state.css then
-        state.css = Content.fetch_chapter_css(client, settings, book, chapter)
-    end
-    xhtml, state.css = apply_chapter_annotations(client, settings, book, chapter, xhtml, state.css)
-    local chapter_assets = {}
-    local cache = settings:get("cache", {})
-    if cache.download_book_images then
-        state.used_asset_names = state.used_asset_names or {}
-        local tar_assets, src_map = Content.download_chapter_assets(client, book, chapter, state.used_asset_names)
-        for _, asset in ipairs(tar_assets) do
-            table.insert(chapter_assets, asset)
-        end
-        xhtml = Content.rewrite_image_sources(xhtml, src_map)
-        local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, state.used_asset_names)
-        xhtml = inline_xhtml
-        for _, a in ipairs(inline_assets) do
-            table.insert(chapter_assets, a)
-        end
-    end
-    return xhtml, chapter_assets
-end
-
 -- Split chapter downloading around annotation fetching so the UI can request
 -- thought batches cooperatively instead of blocking inside Thoughts.apply().
 function Content.fetch_single_chapter_source(client, settings, book, chapter, state)
@@ -1066,11 +1091,20 @@ function Content.fetch_single_chapter_source(client, settings, book, chapter, st
     if not state.css then
         state.css = Content.fetch_chapter_css(client, settings, book, chapter)
     end
+    if book._content_format ~= "txt" then
+        xhtml = Footnotes.normalize_markup(xhtml)
+    end
     return xhtml
 end
 
 function Content.finalize_single_chapter_content(client, settings, book, chapter, xhtml, state)
     state = state or {}
+    -- Apply footnotes (image-based and cross-file). The downloader pipeline
+    -- applies annotations separately; footnotes are handled here so they
+    -- run regardless of annotation settings.
+    local new_css
+    xhtml, new_css = apply_chapter_footnotes(client, settings, book, chapter, xhtml, state.css, state)
+    state.css = new_css
     local chapter_assets = {}
     local cache = settings:get("cache", {})
     if cache.download_book_images then
@@ -1105,7 +1139,7 @@ function Content.fetch_chapters_epub(client, settings, book, chapters, options)
         if not css then
             css = Content.fetch_chapter_css(client, settings, book, chapter)
         end
-        xhtml, css = apply_chapter_annotations(client, settings, book, chapter, xhtml, css)
+        xhtml, css = apply_chapter_enrichments(client, settings, book, chapter, xhtml, css, { chapters = chapters })
         if cache.download_book_images then
             if options.progress then
                 options.progress(chapter_index, #chapters, chapter, "images")
